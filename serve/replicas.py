@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import collections
 import copy
+import hashlib
 import os
 import sys
 import threading
@@ -45,6 +46,9 @@ import time
 BLOCK = 64                          # tokens per hashed block of a prompt
 LOAD_TOKENS = 3000                  # the cost of one request already running on a replica, in prompt tokens
 INDEX_MAX = 262144                  # block hashes kept (about 17M tokens of prompts)
+CONV_MAX = 4096                     # conversations remembered (each keeps its replica while that one runs)
+CONV_MAX_LEN = 128                  # characters kept of a conversation id
+NEW_TALK_SLACK = 2 * BLOCK          # tokens a prompt may lose to its own tail (a template boundary) and still be a turn
 HEAL_COOLDOWN_S = 60.0              # a replica that died is started again at most this often
 
 
@@ -284,9 +288,12 @@ class Router:
     """Which replica holds the start of a prompt: chained hashes of its 64-token blocks, each with the set of replicas
     that served it (a bit mask)."""
 
-    def __init__(self, n: int, cap: int = INDEX_MAX):
-        self.n, self.cap = n, cap
+    def __init__(self, n: int, cap: int = INDEX_MAX, conv_cap: int = CONV_MAX):
+        self.n, self.cap, self.conv_cap = n, cap, conv_cap
         self.blocks: collections.OrderedDict[int, int] = collections.OrderedDict()
+        self.convs: collections.OrderedDict[str, int] = collections.OrderedDict()   # conversation id -> replica
+        self.longest = [0] * n            # the longest prompt each replica has served: tells a new talk from a turn
+        self.conv_balance = [0] * n       # conversations currently bound to each replica: spreads sessions, not steps
         self.lock = threading.Lock()
 
     @staticmethod
@@ -318,10 +325,34 @@ class Router:
                 self.blocks[h] = self.blocks.pop(h, 0) | (1 << r)
             while len(self.blocks) > self.cap:
                 self.blocks.popitem(last=False)
+            self.longest[r] = max(self.longest[r], len(ids))
+
+    def held(self, conv: str) -> int | None:
+        """The replica that holds this conversation, or None (a return makes it the newest entry again)."""
+        with self.lock:
+            r = self.convs.get(conv)
+            if r is not None:
+                self.convs.move_to_end(conv)
+            return r
+
+    def bind(self, conv: str, r: int) -> None:
+        """Record that replica r serves this conversation from now on (the oldest entry goes past the cap)."""
+        with self.lock:
+            old = self.convs.get(conv)
+            if old is not None and old != r:
+                self.conv_balance[old] -= 1
+            if old is None:
+                self.conv_balance[r] += 1
+            self.convs[conv] = r
+            self.convs.move_to_end(conv)
+            while len(self.convs) > self.conv_cap:
+                self.convs.popitem(last=False)
+                self.conv_balance[self.convs[next(iter(self.convs))]] -= 1  # popitem removed the oldest
 
     def forget(self, r: int) -> None:
-        """Replica r lost its cache (it restarted)."""
+        """Replica r lost its cache (it restarted), and with it its conversations."""
         with self.lock:
+            self.longest[r] = 0
             bit = ~(1 << r)
             for h in [h for h, m in self.blocks.items() if m >> r & 1]:
                 m = self.blocks[h] & bit
@@ -329,6 +360,9 @@ class Router:
                     self.blocks[h] = m
                 else:
                     del self.blocks[h]
+            for conv in [c for c, k in self.convs.items() if k == r]:
+                del self.convs[conv]
+                self.conv_balance[r] -= 1
 
 
 class ReplicaEngine:
@@ -345,6 +379,9 @@ class ReplicaEngine:
         d["router"] = Router(len(engines))
         d["load_tokens"] = load_tokens
         d["inflight"] = [0] * len(engines)
+        d["conv_inflight"] = {}                                 # requests live right now under each conversation name
+        d["active_convs"] = {k: set() for k in range(len(engines))}  # conversations with a live request per card
+        d["conv_stack"] = {k: [] for k in range(len(engines))}  # the names inflight on each replica, in route order
         d["run_locks"] = [threading.Lock() for _ in engines]    # an engine without batch slots: one request at a time
         d["lock"] = threading.Lock()
         d["tl"] = threading.local()
@@ -504,8 +541,11 @@ class ReplicaEngine:
             raise err
 
     # ---- routing
-    def route(self, ids) -> int:
+    def route(self, ids, conv: str | None = None) -> int:
         """The replica for this prompt (and its running count raised): lowest cost among the living ones.
+
+        A named `conv` (see `conversation_id`) overrides the cost: it keeps the replica that first served it, and a
+        new one goes to the least busy replica, so a warm conversation is never read again on the other card.
 
         A dedicated port (STRATA_DEDICATED_PORTS in server.py, this module's "pin") names its replica and
         skips the cost: the client asked for that card, and prefix caching must not move it elsewhere."""
@@ -517,14 +557,58 @@ class ReplicaEngine:
                 return -1
             if pinned in alive:
                 k = pinned
+            elif conv:
+                k = self._conversation_replica(conv, alive, ids, got)
             else:
                 cost = {k: (len(ids) - got[k]) + self.load_tokens * self.inflight[k] for k in alive}
                 # the least loaded wins a tie of cost (equal cards, nothing cached): spread, do not pile on replica 0
                 k = min(alive, key=lambda k: (cost[k], self.inflight[k], self.routed[k]))
+                # A prompt the best replica has not seen up to its own longest one is a new talk, not the next turn of
+                # the one it holds: clients that share a long system prompt would otherwise all land on whichever
+                # replica served them first, and the other card would idle.  A new talk goes to the least busy card.
+                best = max(alive, key=lambda r: got[r])
+                longest = self.router.longest[best]
+                # the prompt's own last tokens (the assistant header, the turn marker) are not a prefix of the built
+                # prompt, so a continuation loses a few dozen tokens: only a real loss of two blocks means a new talk
+                if longest and got[best] < 0.98 * longest and longest - got[best] > NEW_TALK_SLACK:
+                    # a new talk pays its prefill anyway, so a free card comes before a warm one: a warm card that
+                    # keeps taking new conversations while it is busy would leave the other card idle
+                    k = min(alive, key=lambda r: (self.inflight[r], cost[r], self.routed[r]))
             self.inflight[k] += 1
             self.routed[k] += 1
+            if conv:
+                self.conv_inflight[conv] = self.conv_inflight.get(conv, 0) + 1
+                self.conv_stack[k].append(conv)
+                self.active_convs[k].add(conv)
         if len(alive) < len(self.engines):
             self.heal()
+        return k
+
+    def _conversation_replica(self, conv: str, alive: list[int], ids, got) -> int:
+        """A named conversation keeps its replica.  A new name is placed by the card holding the fewest
+        conversations and bound there; a replica that restarted forgot its conversations (Router.forget), so they
+        are new.  Two live requests under one name are two sessions, not one conversation re-asking: a name is
+        derived from content, and identical openings collide (measured 2026-10-20: five A/B arms with byte-equal
+        prompts merged into one name and ran on a single card).  The second concurrent arrival spreads."""
+        held = self.router.held(conv)
+        if held in alive and self.conv_inflight.get(conv, 0) < 1:      # the count is taken before this request joins
+            return held
+        if held in alive:
+            alive = [k for k in alive if k != held] or [held]   # one card left: two sessions share it after all
+        cost = {k: (len(ids) - got[k]) + self.load_tokens * self.inflight[k] for k in alive}
+        # place by conversations, not steps: a session arriving while both cards idle looks free on both, and a
+        # warmth-first or step-first rule then piles every hot session onto the card that cached the shared prefix
+        # first (live 2026-10-20: two DSH sessions, one card at 100% for 17 steps, the other idle).  A new
+        # conversation takes the card holding the fewest conversations, so sessions split and each card works.
+        # live conversations per card first: a card that just took one must not take the next while the other
+        # idles; inflight breaks a tie of conversations, then warmth, then history
+        act = self.active_convs
+        k = min(alive, key=lambda k: (len(act[k]), self.inflight[k], cost[k], self.routed[k]))
+        self.router.bind(conv, k)
+        # the binding table is otherwise invisible from outside: without this line an operator watching the cards
+        # cannot tell "both sessions are on one card" from "this card's session is simply idle right now"
+        print(f"[strata] replica {k}: bound new conversation {conv[:48]} (live conversations now "
+              f"{[len(act[r]) for r in range(len(self.engines))]}, running {self.inflight})", flush=True)
         return k
 
     def heal(self) -> None:
@@ -553,7 +637,7 @@ class ReplicaEngine:
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         # imported here: serve.server imports this module
         from serve.server import EngineDied, EngineNonFinite
-        k = self.route(ids)
+        k = self.route(ids, getattr(cancel, "_strata_conversation", None))
         if k < 0:
             raise EngineDied("no replica is running; this request was not sent")
         e = self.engines[k]
@@ -588,6 +672,13 @@ class ReplicaEngine:
                 self.run_locks[k].release()
             with self.lock:
                 self.inflight[k] -= 1
+                stack = self.conv_stack[k]
+                if stack:
+                    c = stack.pop()
+                    self.conv_inflight[c] -= 1
+                    if self.conv_inflight[c] <= 0:
+                        del self.conv_inflight[c]
+                        self.active_convs[k].discard(c)
             if nonfinite:                       # #879: the engine dropped every cached conversation
                 self.router.forget(k)
             elif produced:
