@@ -1287,6 +1287,15 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
     return c;
 #endif
 }
+__device__ __forceinline__ void nw_sync_lds() {
+#if STRATA_NAT_W11
+    __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#elif STRATA_NAT_W12
+    __asm__ volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap)
 // where nw_capped(WT) says the cap applies.
@@ -1350,7 +1359,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
             d[1] = make_uint4(q[4], q[5], q[6], q[7]);
             *(float2*) &ws[buf][ur][2 * uj] = make_float2(s0, s1);
         };
-        __syncthreads();                                          // the previous item is done with the buffers
+        nw_sync_lds();                                            // the previous item is done with the buffers
         if (tid < kTileRows) {
             const int r = row0 + min(tid, nrows - 1);             // rows past the tile's end repeat its last one
             srow[tid] = GU ? src[r] : r;
@@ -1359,7 +1368,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         load_unit<WT>(unit(0), sub(0), raw);
         put(raw, 0);
         if (NS > 1) load_unit<WT>(unit(1), sub(1), raw);
-        __syncthreads();                                          // srow
+        nw_sync_lds();                                            // srow and stage 0's weights
         const bool on = 32 * wn < nrows;
         const uint8_t* brow[2];
 #pragma unroll
@@ -1463,7 +1472,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
             }
         }
         if constexpr (GU) {
-            if constexpr (ALIAS) __syncthreads();                 // every wave is done reading the weight buffers
+            if constexpr (ALIAS) nw_sync_lds();                   // every wave is done reading the weight buffers
             if (on) {
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
@@ -1486,7 +1495,7 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
 #endif
                     }
             }
-            __syncthreads();
+            nw_sync_lds();
             // H block fb (features 64 fb ..) to int8 per 32, natural order: a thread per (tile row, half)
             if (tid < 2 * kTileRows) {
                 const int r = tid >> 1, hh = tid & 1;
