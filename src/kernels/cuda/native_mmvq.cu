@@ -1620,8 +1620,96 @@ __global__ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, con
     }
 }
 
+// B7 (STRATA_DENSE_LDS=1, or b6 rows mode 16): the window's activations staged in LDS once per block, R rows per
+// warp over the whole row, NWB warps per block.  Each lane replays the per-thread work of the one-column kernel's four
+// warps one after another (thread 32 w + lane: blocks tid / T, + BPI, ...), keeping that thread's sum, and folds the
+// four sums in warp order before the same butterfly: every output is bitwise the one-column kernel's.  The point is the
+// activation traffic: B6 reads all NCOLS columns per 2-4 rows from L0/L2, B7 per NWB * R rows, from LDS.
+template<typename F, int NCOLS, int R, int NWB>
+__launch_bounds__(NWB * WARP)
+__global__ void b7_mmvq_lds_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                   float* __restrict__ y, int n_in, int n_out) {
+    using XB = B6X<F>;
+    extern __shared__ int b7_sx[];
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    {
+        const int n_int = NCOLS * x_stride * int(sizeof(Q81Block) / 4);
+        const int* xi = reinterpret_cast<const int*>(x);
+        for (int i = int(threadIdx.y) * WARP + int(threadIdx.x); i < n_int; i += NWB * WARP) b7_sx[i] = xi[i];
+    }
+    __syncthreads();
+    const Q81Block* sx = reinterpret_cast<const Q81Block*>(b7_sx);
+    const int lane = int(threadIdx.x);
+    const int row0 = (int(blockIdx.x) * NWB + int(threadIdx.y)) * R;
+    if (row0 >= n_out) return;
+    float tot[NCOLS][R];
+#pragma unroll
+    for (int v = 0; v < WARPS; ++v) {
+        const int tid = WARP * v + lane;
+        const int kqs = F::kqs(tid);
+        float cur[NCOLS][R] = {};
+        for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < R; ++i) {   // per row as b6_mmvq_rows_kernel (rows outer); the columns re-read from LDS
+                if (row0 + i < n_out) {
+                    const typename XB::W wv = XB::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) cur[j][i] += XB::dot(wv, XB::xload(sx + j * x_stride + kby, kqs));
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < R; ++i) tot[j][i] = v == 0 ? cur[j][i] : tot[j][i] + cur[j][i];
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const float s = warp_sum(tot[j][i]);
+            if (lane == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = s;
+        }
+}
+bool b7_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DENSE_LDS"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// rows per warp (STRATA_B7_R=1/2/4 forces): 2 for the heads and from 5 columns, else 1 (b6_mmvq_bench, R9700)
+int b7_rows(int n_out, int ncols) {
+    static const int env = [] { const char* v = std::getenv("STRATA_B7_R"); return v ? std::atoi(v) : 0; }();
+    if (env == 1 || env == 2 || env == 4) return env;
+    return (n_out >= 65536 || ncols >= 5) ? 2 : 1;
+}
+template<typename F, int NCOLS, int R, int NWB>
+void b7_go(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, std::size_t lds, cudaStream_t s) {
+    b7_mmvq_lds_kernel<F, NCOLS, R, NWB><<<unsigned((n_out + NWB * R - 1) / (NWB * R)), dim3(WARP, NWB), lds, s>>>(
+        w, x, y, n_in, n_out);
+}
+template<typename F, int NCOLS>
+bool b7_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    if constexpr (!B6X<F>::ok) {
+        return false;
+    } else {
+        const std::size_t lds = std::size_t(NCOLS) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+        // only where it measured faster (b6_mmvq_bench, R9700): at least 2048 rows of at most 4096 (the 6144-wide output
+        // projections stage too much per block and lose occupancy)
+        if (n_in > 4096 || n_out < 2048 || n_in / F::DIV < 1 || lds > 64 * 1024) return false;
+        // Q6_K: B6 is as fast below 6 columns (below 4 for the heads)
+        if (std::is_same_v<F, Q6KTraits> && NCOLS < (n_out >= 65536 ? 4 : 6)) return false;
+        const int r = b7_rows(n_out, NCOLS);
+        if (r == 1) b7_go<F, NCOLS, 1, 8>(w, x, y, n_in, n_out, lds, s);
+        else if (r == 2) b7_go<F, NCOLS, 2, 8>(w, x, y, n_in, n_out, lds, s);
+        else b7_go<F, NCOLS, 4, 8>(w, x, y, n_in, n_out, lds, s);
+        return true;
+    }
+}
+
 // the B6 launch for a format that has a B6X: true when it ran.  b6_rows_mode(): -1 = auto (gfx12 per-shape table, off
-// elsewhere), 0 = off, 1 = 2 rows per block, else 2 / 4 / 8 rows.
+// elsewhere), 0 = off, 1 = 2 rows per block, else 2 / 4 / 8 rows, 16 = B7 only (b6_mmvq_bench).  STRATA_DENSE_LDS=1
+// puts B7 ahead of the rows modes where it applies.
 template<typename F, int NCOLS>
 int b6_default_rows_gfx12(int n_out) {
     if constexpr (std::is_same_v<F, Q4KTraits> || std::is_same_v<F, Q5KTraits>) {
@@ -1646,7 +1734,9 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         return false;
     } else {
         const int mode = b6_rows_mode();
-        if (mode == 0 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
+        if (g_multi_exact && !s26_tsum_on() && (mode == 16 || (mode != 0 && b7_on())) && b7_launch<F, NCOLS>(w, x, y, n_in, n_out, s))
+            return true;
+        if (mode == 0 || mode == 16 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
         int rows = 0;
         if (mode < 0) {
             if (dev_class() == 1) rows = b6_default_rows_gfx12<F, NCOLS>(n_out);
