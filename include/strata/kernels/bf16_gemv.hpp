@@ -50,6 +50,8 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 /// x must be 8-byte aligned, w 4-byte aligned, and y 4-byte aligned. Throws on invalid geometry/pointers.
 /// The device buffers must not overlap; allocation bounds remain the caller's responsibility.
 /// No allocations or synchronization, including when stream is null (the CUDA default stream).
+/// STRATA_MMVF_ROWS at one token (tests): 0 = the one-row-per-block kernel, -1 = the default (the rows kernel)
+void bf16_mmvf_set_rows_one(int v);
 void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
                          int64_t n_in, int64_t n_out, void* stream);
 /// `ncols` columns at once: x is [ncols][n_in], y is [ncols][n_out]; each column bitwise equal to a
