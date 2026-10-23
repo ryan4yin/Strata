@@ -35,6 +35,20 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
                        int h_v, void* stream);
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
+/// fuse-gdn (STRATA_FUSE_GDNCONV): a batch window's conv of every slot group in one launch - group i is rows
+/// [first[i], first[i] + ntok[i]) of qkv / h over its own slot's conv history hist[i], each row exactly as
+/// gdn_conv_l2_multi(hist[i], qkv + first[i] * C, conv_w, h + first[i] * C, C, qk_heads, eps, ntok[i], 0, commit) - and,
+/// with `x` set, gdn_ab_multi over all rows (n_tok = the groups' rows) in the same launch (gdn_conv_ab_multi's split).
+/// Groups are contiguous from row 0; `commit` needs 1-row groups.  Bitwise the per-group calls.
+struct GdnConvGroups {
+    float* hist[8] = {};
+    int first[8] = {};
+    int ntok[8] = {};
+    int n = 0;
+};
+void gdn_conv_groups(const GdnConvGroups& groups, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                     float eps, bool commit, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
+                     const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd, int h_v, void* stream);
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y
 /// (T, value_dim)).  With `n_keep == nullptr` the state is read and NOT written (verify); otherwise the first
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
