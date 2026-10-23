@@ -500,6 +500,14 @@ bool fuse_shpair_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHPAIR"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_FUSE_ROUTEBELL=1: the window's top-10 (route_multi) and the doorbell (doorbell_publish_res) in one launch
+// (native_router_top10_multi_bell): the same ids, weights and published rows, one kernel node fewer per layer and group,
+// and the bell no longer waits for a launch of its own.  Only where nothing runs between the two (no route prior /
+// resident swap, no device plan, the plain doorbell).  Opt-in.
+bool fuse_routebell_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ROUTEBELL"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 // STRATA_FUSE_SHGATE=1 (with STRATA_FUSE_COMBINE, outside the all-resident path): the shared expert's gate row rides in
 // the router's GEMV launch (bf16_gemv_fp32_mmvf_multi_aux) and its sigmoid + row scale in that combine
 // (native_moe_combine_multi_hits_mapped's shared_gate), as STRATA_LFUSE does on the all-resident path: two kernel nodes
@@ -2461,6 +2469,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = (lfuse_on(n) && g_lfuse_gate()) || shgate_on(n, tb) ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        const float route_prior = g_route_prior();
+        // STRATA_FUSE_ROUTEBELL: the doorbell below rides in the top-10's launch where nothing runs between them
+        bool bell_done = false;
+        bool bell_fuse = fuse_routebell_on() && !ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
+                         !(route_prior > 0.0f && hits_.d_res != nullptr) && !(route_resident_cfg().margin > 0.0f && hits_.d_res != nullptr);
+#if defined(STRATA_USE_HIP)
+        bell_fuse = bell_fuse && !g_doorbell_store;
+#endif
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -2470,6 +2486,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (bell_fuse)
+                    bell_done = native_router_top10_multi_bell(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
+                                                               hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
+                                                               (int) g.n_expert, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                                               m_ids_ + tb * K, m_seq_, cs);
+                if (!bell_done)
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -2491,7 +2513,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
         // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
-        const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
@@ -2525,7 +2546,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (remote_opt_ || always_publish_)
                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-            else {
+            else if (!bell_done) {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
