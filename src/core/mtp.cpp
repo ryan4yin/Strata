@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/core/tail_prof.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1655,6 +1656,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    const auto tp_draft0 = strata::core::TailProf::on() ? strata::core::TailProf::now() : std::chrono::steady_clock::time_point{};
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1706,6 +1708,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
+        strata::core::TailProf& tp = strata::core::tail_prof();
+        const bool tpo = strata::core::TailProf::on();
+        const auto tpl = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
+        if (tpo) tp.add(tp.kDraftPrep, tp_draft0, tpl);
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
@@ -1716,6 +1722,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                 return false;
             }
         }
+        const auto tpw = tpo ? tp.now() : tpl;
+        if (tpo) tp.add(tp.kDraftLaunch, tpl, tpw);
         (void) cudaStreamQuery(cs_);
         prefetch_ple(tokens[a]);
         progress_at("mtp draft: waiting for the GPU");   // #2065
@@ -1736,6 +1744,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+        if (tpo) tp.add(tp.kDraftWait, tpw, tp.now());
         const int last = max_steps - 1;
         drafts[last] = ((volatile int32_t*) h_out_)[last];
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];

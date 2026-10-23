@@ -1,3 +1,4 @@
+#include "strata/core/tail_prof.hpp"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -12646,7 +12647,16 @@ int main(int argc, char** argv) {
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
+        // STRATA_FUSE_PLEPF=1: the next window's PLE rows prefetched while the commit and the drafts run (the slot
+        // drafters' PLE sessions have no table, so their own prefetch never runs, and stage_batch read every row cold)
+        static const bool ple_pf = [] { const char* v = std::getenv("STRATA_FUSE_PLEPF"); return v != nullptr && std::atoi(v) != 0; }();
+        long long tp_long = 0;   // STRATA_DBG_TAIL: main-loop gaps past 5 ms (a request's prompt read)
         auto batch_step = [&]() -> bool {
+            strata::core::TailProf& tp = strata::core::tail_prof();   // STRATA_DBG_TAIL
+            const bool tpo = strata::core::TailProf::on();
+            const Clock::time_point tp_bs0 = Clock::now();
+            const Clock::time_point tp_prev = tp.last_end;
+            tp.last_end = Clock::time_point{};   // (set again only by a window that runs to its end)
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -12710,6 +12720,7 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds; bt_a_swapped0 = a_swapped;
             }
             const Clock::time_point w0 = Clock::now();
+            if (tpo) tp.add(tp.kPlan, tp_bs0, w0);
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -12737,6 +12748,8 @@ int main(int argc, char** argv) {
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
+            const Clock::time_point tp_c0 = Clock::now();
+            if (tpo) { tp.add(tp.kRunTotal, w0, w1); tp.add(tp.kPreCommit, w1, tp_c0); }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
@@ -12745,12 +12758,21 @@ int main(int argc, char** argv) {
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
+            if (tpo) tp.add(tp.kCommitTotal, tp_c0, w2);
             ++bt_windows;
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
             for (int t = 0; t < A; ++t) {
+                const Clock::time_point tp_e0 = Clock::now();
+                if (ple_pf && batch_mtp && t == 0)   // row 0 of every slot that goes on: its last kept pick
+                    for (int u = 0; u < A; ++u) {
+                        const int bu = active[u];
+                        const BSlot& su = bs[(size_t) bu];
+                        if (!su.active || su.stop || ver.nonfinite_in(first[u])) continue;
+                        (void) ver.ple_prefetch_slot(bu, outb[first[u] + keep[bu] - 1], -1);
+                    }
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
@@ -12785,6 +12807,8 @@ int main(int argc, char** argv) {
                     sl.x = y;
                     sl.p += 1;
                 }
+                const Clock::time_point tp_d0 = Clock::now();
+                if (tpo) tp.add(tp.kEmitPrint, tp_e0, tp_d0);
                 if (batch_mtp && sl.active) {
                     // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
                     // chain, so with a layer split they are on the last stage's GPU, where the drafters are).  The copy is
@@ -12801,10 +12825,15 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     sl.draft_ready = true;
+                    if (ple_pf) (void) ver.ple_prefetch_slot(b, sl.x, sl.draft[0]);   // row 1: the draft after sl.x
                 }
+                if (tpo) tp.add(tp.kDraftTotal, tp_d0, Clock::now());
             }
+            const Clock::time_point tp_f0 = Clock::now();
             std::fflush(stdout);
+            if (tpo) tp.add(tp.kFlush, tp_f0, Clock::now());
             bt_emit += msd(w2, Clock::now());
+            const Clock::time_point tp_a0 = Clock::now();
             if (adapt_run.th.joinable()) {
                 const Clock::time_point wa = Clock::now();
                 adapt_run.th.join();
@@ -12817,7 +12846,9 @@ int main(int argc, char** argv) {
                 apply_pending(true);   // the copies land and the tables follow (the next window plans from them)
                 bt_adapt_wait += msd(wa, Clock::now());
             }
+            if (tpo) tp.add(tp.kAdapt, tp_a0, Clock::now());
             strata::core::progress().busy.store(was_busy);
+            const Clock::time_point tp_r0 = Clock::now();
             report_batch_window(S, A, !batch_on(), w0);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
@@ -12861,8 +12892,35 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: MTP proposals accepted %lld of %lld (%.1f%%)\n",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
+                if (tpo && tp.windows > 0) {   // STRATA_DBG_TAIL: the host's tail, per window
+                    const double n = (double) tp.windows;
+                    auto M = [&](int i) { return tp.ms[i] / n; };
+                    std::fprintf(stderr, "strata batch tail (STRATA_DBG_TAIL, ms/window over %lld windows): loop %.3f "
+                                         "(%lld gaps > 5 ms left out) + plan %.3f + run %.3f [prep %.3f, launch call %.3f] + "
+                                         "pre-commit %.3f + commit %.3f [launch call %.3f, sync %.3f] + BT lines %.3f + "
+                                         "copy+draft %.3f [prep %.3f, launch calls %.3f, wait %.3f] + fflush %.3f + adapt "
+                                         "%.3f + report %.3f; run prep: pre_launch %.3f, checks+refresh_ar %.3f, graphs %.3f, "
+                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
+                                 M(tp.kPlan), M(tp.kRunTotal), M(tp.kRunPrep), M(tp.kRunLaunch), M(tp.kPreCommit),
+                                 M(tp.kCommitTotal), M(tp.kCommitLaunch), M(tp.kCommitSync), M(tp.kEmitPrint),
+                                 M(tp.kDraftTotal), M(tp.kDraftPrep), M(tp.kDraftLaunch), M(tp.kDraftWait), M(tp.kFlush),
+                                 M(tp.kAdapt), M(tp.kReport), M(tp.kRunPreLaunch), M(tp.kSbRefresh), M(tp.kSbCapture),
+                                 M(tp.kSbRecords), M(tp.kSbPle), tp.ple_checked, tp.ple_bad);
+                    tp = strata::core::TailProf{};
+                    tp_long = 0;
+                }
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
+            }
+            if (tpo) {
+                const Clock::time_point e = Clock::now();
+                tp.add(tp.kReport, tp_r0, e);
+                if (tp_prev != Clock::time_point{}) {   // the main loop between the last window and this one
+                    if (tp_bs0 - tp_prev < std::chrono::milliseconds(5)) tp.add(tp.kLoop, tp_prev, tp_bs0);
+                    else ++tp_long;
+                }
+                ++tp.windows;
+                tp.last_end = e;
             }
             return true;
         };

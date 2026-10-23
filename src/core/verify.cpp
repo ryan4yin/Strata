@@ -30,6 +30,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/core/tail_prof.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -599,6 +600,13 @@ bool fuse_gatemerge_q8_on() {
 
 // fuse-gdn: STRATA_FUSE_GDNQ8=1 - a batch window's GDN recurrence in one launch (STRATA_BATCH_GDN_GROUPS=1) also writes
 // the out projection's q8_1 input (gdn_step_norm_groups' xq_out) instead of a quantize launch after it
+// STRATA_FUSE_PLELATE=1: run_slot_rows gathers the window's PLE rows after the graph's launch (as run() does), not in
+// stage_batch before it: the graph reads them after its layer-1 wait on the PLE flag, and the read overlaps layer 0
+bool fuse_plelate_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_PLELATE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 bool fuse_gdnq8_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_GDNQ8"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
@@ -4770,9 +4778,25 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     return true;
 }
 
-bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err) {
+// STRATA_DBG_PLECHECK=1: every row a batch window's gather wrote, read again on its own (read_row: no prefetch) and
+// compared bit for bit
+static void ple_check_rows(const strata::kernels::PleTable& tab, const uint32_t* rows, size_t n_tokens, const float* got) {
     using namespace strata::kernels;
+    strata::core::TailProf& tp = strata::core::tail_prof();
+    float ref[PLE_HEAD_DIM];
+    for (size_t i = 0; i < n_tokens * PLE_N_HEADS; ++i) {
+        tab.read_row(rows[i], ref);
+        ++tp.ple_checked;
+        if (std::memcmp(ref, got + i * PLE_HEAD_DIM, sizeof ref) != 0) ++tp.ple_bad;
+    }
+}
+
+bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                           std::string& err, bool defer_ple) {
+    using namespace strata::kernels;
+    strata::core::TailProf& tp = strata::core::tail_prof();
+    const bool tpo = strata::core::TailProf::on() && next_ == nullptr;
+    const auto tq0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
     // the row layout: a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split,
     // whose hand-off buffers hold kVerifyMaxT rows, or set_handoff_rows' (a stage that hands rows on or takes them)
     if (const char* why = batch_rows_error(rows, S, pos, (int) slots_.size(), max_t_, hbase,
@@ -4788,6 +4812,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             return false;
         }
     refresh_ar();
+    const auto tq1 = tpo ? tp.now() : tq0;
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
@@ -4800,6 +4825,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     if (!capture_batch(rows, S, hbase, err) || (!staging_deferred_ && !capture_commit_batch(rows, S, hbase, err)))
         return false;
     const Clock::time_point t0 = Clock::now();
+    if (tpo) { tp.add(tp.kSbRefresh, tq0, tq1); tp.add(tp.kSbCapture, tq1, t0); }
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
@@ -4810,6 +4836,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
+    const auto tq2 = tpo ? tp.now() : tq0;
+    if (tpo) tp.add(tp.kSbRecords, t0, tq2);
     if (ss_->ple.ready() && ple_stage()) {
         uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
         for (int t = 0; t < S; ++t) {
@@ -4821,8 +4849,15 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
         }
-        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+        if (defer_ple) {
+            ple_late_rows_.assign(ple_rows, ple_rows + (size_t) S * PLE_N_HEADS);
+            ple_late_n_ = S;
+        } else {
+            if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+            if (strata::core::TailProf::ple_check()) ple_check_rows(*ss_->ple.table, ple_rows, (size_t) S, h_ple_);
+        }
     }
+    if (tpo) tp.add(tp.kSbPle, tq2, tp.now());
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
     const int64_t CB = 2 + max_t_;
@@ -4849,6 +4884,37 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     return true;
 }
 
+bool Verifier::ple_prefetch_slot(int slot, int32_t tok0, int32_t tok1) {
+    using namespace strata::kernels;
+    if (!(ss_->ple.ready() && ple_stage()) || slot < 0 || slot >= (int) slots_.size()) return false;
+    const SessionState& sx = *slots_[(size_t) slot];
+    uint32_t r16[PLE_N_HEADS];
+    if (tok1 < 0) {
+        const int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+        ngram_rows(&tok0, prev, 1, ss_->ple.consts, r16);
+    } else {
+        const int32_t prev[2] = {sx.ple_prev[1], tok0};
+        ngram_rows(&tok1, prev, 1, ss_->ple.consts, r16);
+    }
+    ss_->ple.table->prefetch_rows(r16);
+    return true;
+}
+
+bool Verifier::gather_ple_late(std::string& err) {
+    if (ple_late_n_ == 0) return true;
+    const strata::core::TailProf& tp = strata::core::tail_prof();
+    const bool tpo = strata::core::TailProf::on() && next_ == nullptr;
+    const auto t0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
+    const int n = ple_late_n_;
+    ple_late_n_ = 0;
+    if (!ss_->ple.table->gather_batch(ple_late_rows_.data(), (size_t) n, h_ple_, err)) return false;
+    if (strata::core::TailProf::ple_check()) ple_check_rows(*ss_->ple.table, ple_late_rows_.data(), (size_t) n, h_ple_);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    if (tpo) strata::core::tail_prof().add(tp.kSbPle, t0, tp.now());
+    return true;
+}
+
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
     int rows[8] = {};
@@ -4861,9 +4927,16 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
+    strata::core::TailProf& tp = strata::core::tail_prof();
+    const bool tpo = strata::core::TailProf::on();
+    const auto tp0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (tpo) tp.add(tp.kRunPreLaunch, tp0, tp.now());
+    ple_late_n_ = 0;
+    if (!stage_batch(rows, S, 0, tokens, pos, err, fuse_plelate_on())) return false;
+    const auto tp1 = tpo ? tp.now() : tp0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
+    if (tpo) { tp.add(tp.kRunPrep, tp0, tp1); tp.add(tp.kRunLaunch, tp1, tp.now()); }
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
@@ -4879,6 +4952,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // graph waits on host doorbells the skipped service never raises (GPU at 100%, host in the sync below).
     if (ar_on()) {
         if (ss_->ple.ready() && ple_stage()) {
+            if (!gather_ple_late(err)) return false;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             strata_store_fence();
             *flag = 1;
@@ -4944,6 +5018,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             *(volatile uint32_t*) h_flagA_ = want;
             raise_flag(h_flagB_, want);
         }
+        if (k == 0 && !gather_ple_late(err)) return false;   // (layer 0's plan is out: its experts run meanwhile)
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
@@ -4991,10 +5066,15 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
+        strata::core::TailProf& tp = strata::core::tail_prof();
+        const bool tpo = strata::core::TailProf::on() && next_ == nullptr;   // (one stage: the main card's)
+        const auto tp0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+        const auto tp1 = tpo ? tp.now() : tp0;
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+        if (tpo) { tp.add(tp.kCommitLaunch, tp0, tp1); tp.add(tp.kCommitSync, tp1, tp.now()); }
     }
     if (ple_stage())
         for (int t = 0; t < S;) {
