@@ -111,6 +111,9 @@ bool native_expert_fuse_sw_gu();
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down, 3 gate/up only).
 void native_expert_set_mode(int mode, int phase);
+/// The AMD layout `native_expert_grouped` will pick for a call with grid_groups 0 (0 = the CUDA / mode-0 layout).
+/// Fusions and STRATA_EXPDEC_V2 run on that layout only where its kernels implement them.
+int native_expert_mode();
 
 /// APR (prism.hadamard): y = H_block (signs * x) per block of `block` values of each of `rows` rows of `width`
 /// (x == y allowed).  `signs`: a device vector of `width` signs, or nullptr (identity).  The same floats as the CPU's
