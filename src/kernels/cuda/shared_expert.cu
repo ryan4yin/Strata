@@ -267,6 +267,12 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
 }
 
+void shared_expert_sigmoid_scale_rows(float* out, const float* g, int64_t n_embd, int n_tok, void* stream) {
+    launch_sigmoid_scale_rows(out, g, (int) n_embd, n_tok, static_cast<cudaStream_t>(stream));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_sigmoid_scale_rows: ") + cudaGetErrorString(e));
+}
+
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     // gate (n_ff f32) | up (n_ff f32) | q8_0 (n_ff/32*34) | q8k (n_ff/256*292) | g (1 f32), 16-byte aligned
     const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;

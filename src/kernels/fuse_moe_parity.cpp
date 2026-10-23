@@ -3,6 +3,7 @@
 // random inputs (GPU, synthetic, no model).  Exit 0 when all match.
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -188,7 +189,8 @@ float odd_float(std::mt19937& rng) {
 // STRATA_FUSE_COMBINE: native_moe_combine_multi_hits_mapped vs
 //   copy_rows_from_mapped_after + native_moe_combine_multi_hits_added                  (skip == nullptr)
 //   wait_flag_ge_or + copy_or_zero_from_mapped + native_moe_combine_multi_hits_added   (skip: the device plan)
-int test_combine(std::mt19937& rng, cudaStream_t s) {
+// gated (STRATA_FUSE_SHGATE): the reference scales `shared` by sigmoid(sg) first (shared_expert_multi's last launch)
+int test_combine(std::mt19937& rng, cudaStream_t s, bool gated) {
     using namespace strata::kernels;
     native_moe_combine_set_enabled(true);
     int bad = 0, cases = 0;
@@ -238,9 +240,18 @@ int test_combine(std::mt19937& rng, cudaStream_t s) {
                         } else {
                             copy_rows_from_mapped_after(flag_d, ring, parts, m_d, (int64_t) rows, N, dd, cd + 1, s);
                         }
-                        native_moe_combine_multi_hits_added(parts, hd, dd, cd + 1, wd, shd, o1, N, K, n, s);
+                        float* sgd = dev<float>(8);
+                        float* shs = dev<float>((size_t) n * N);   // the scaled copy (reference)
+                        if (gated) {
+                            std::vector<float> sg(8);
+                            for (auto& v : sg) v = rng() % 8 == 0 ? odd_float(rng) : 4.0f * std::normal_distribution<float>(0, 1)(rng);
+                            up(sgd, sg);
+                            check(cudaMemcpy(shs, shd, (size_t) n * N * 4, cudaMemcpyDeviceToDevice), "copy");
+                            shared_expert_sigmoid_scale_rows(shs, sgd, N, n, s);
+                        }
+                        native_moe_combine_multi_hits_added(parts, hd, dd, cd + 1, wd, gated ? shs : shd, o1, N, K, n, s);
                         native_moe_combine_multi_hits_mapped(m_d, hd, dd, cd + 1, wd, shd, o2, N, K, n, flag_d, ring,
-                                                             dp ? skip : nullptr, nullptr, s);
+                                                             dp ? skip : nullptr, gated ? sgd : nullptr, s);
                         check(cudaStreamSynchronize(s), "sync");
                         const auto a = down(o1, (size_t) n * N), b = down(o2, (size_t) n * N);
                         ++cases;
@@ -253,13 +264,14 @@ int test_combine(std::mt19937& rng, cudaStream_t s) {
                         }
                         nan_bits += d > 0 ? d : 0;
                         cudaFreeHost(m_h); cudaFreeHost(flag); cudaFree(skip); cudaFree(parts); cudaFree(hd); cudaFree(wd);
-                        cudaFree(shd); cudaFree(o1); cudaFree(o2); cudaFree(dd); cudaFree(cd);
+                        cudaFree(shd); cudaFree(sgd); cudaFree(shs); cudaFree(o1); cudaFree(o2); cudaFree(dd); cudaFree(cd);
                     }
                 }
             }
         }
     }
-    std::printf("  %-60s %s (%d cases%s)\n", "STRATA_FUSE_COMBINE combine_hits_mapped == copy + combine_hits",
+    std::printf("  %-60s %s (%d cases%s)\n", gated ? "STRATA_FUSE_SHGATE combine_hits_mapped == scale + copy + combine"
+                                                     : "STRATA_FUSE_COMBINE combine_hits_mapped == copy + combine_hits",
                 bad ? "*** NO ***" : g_nan ? "bitwise but NaN-vs-NaN" : "bitwise", cases,
                 g_nan ? (", NaN inputs: " + std::to_string(nan_bits) + " NaN outputs differ in sign/payload only").c_str() : "");
     return bad;
@@ -277,10 +289,12 @@ int main(int argc, char** argv) {
     int bad = 0;
     if (only.empty() || only == "fetch") bad += test_fetch(rng, s);
     if (only.empty() || only == "combine") {
-        bad += test_combine(rng, s);
-        g_nan = true;   // the same with NaN inputs: every non-NaN output bitwise, NaN outputs NaN
-        bad += test_combine(rng, s);
-        g_nan = false;
+        for (const bool gated : {false, true}) {
+            bad += test_combine(rng, s, gated);
+            g_nan = true;   // the same with NaN inputs: every non-NaN output bitwise, NaN outputs NaN
+            bad += test_combine(rng, s, gated);
+            g_nan = false;
+        }
     }
     std::printf("fuse_moe_parity: %s\n", bad ? "FAILED" : "all bitwise");
     return bad ? 1 : 0;
