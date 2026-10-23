@@ -11977,14 +11977,15 @@ int main(int argc, char** argv) {
                                          "pre-commit %.3f + commit %.3f [launch call %.3f, sync %.3f] + BT lines %.3f + "
                                          "copy+draft %.3f [prep %.3f, launch calls %.3f, wait %.3f] + fflush %.3f + adapt "
                                          "%.3f + report %.3f; run prep: pre_launch %.3f, checks+refresh_ar %.3f, graphs %.3f, "
-                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld (early %lld, ended %lld), checked %lld, %lld differ; acommit hits %lld\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
+                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld (early %lld, ended %lld), checked %lld, %lld differ; acommit hits %lld, keep echoes %lld, %lld differ\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
                                  M(tp.kPlan), M(tp.kRunTotal), M(tp.kRunPrep), M(tp.kRunLaunch), M(tp.kPreCommit),
                                  M(tp.kCommitTotal), M(tp.kCommitLaunch), M(tp.kCommitSync), M(tp.kEmitPrint),
                                  M(tp.kDraftTotal), M(tp.kDraftPrep), M(tp.kDraftLaunch), M(tp.kDraftWait), M(tp.kFlush),
                                  M(tp.kAdapt), M(tp.kReport), M(tp.kRunPreLaunch), M(tp.kSbRefresh), M(tp.kSbCapture),
                                  M(tp.kSbRecords), M(tp.kSbPle), tp.ple_checked, tp.ple_bad,
                                  tp.pair_rounds, tp.early_rounds, tp.early_bad, tp.draft_checked, tp.draft_bad,
-                                 strata::core::acommit_dbg().hits.load());
+                                 strata::core::acommit_dbg().hits.load(), strata::core::acommit_dbg().echo_checked,
+                                 strata::core::acommit_dbg().echo_bad);
                     tp = strata::core::TailProf{};
                     tp_long = 0;
                 }
