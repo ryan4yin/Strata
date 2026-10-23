@@ -2498,13 +2498,16 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_v2_kernel(GrMulti m, float
     else gr_down_q8_v2_body<T, R, false, JT>(m, part, ssg, xs, red);
 }
 
-template <int T>
+// QL: part 16-byte aligned, read a row quad (4 consecutive rows, the last quad the inject rows) a thread
+template <int T, bool QL>
 __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_v2_kernel(GrMulti m, const float* __restrict__ part,
                                                                   const float* __restrict__ ssg) {
     constexpr int P = pow2_ceil(T);
     constexpr int RPW8 = HC * Q32_COLS / Q32_WARPS;                  // 8 rows a warp
     constexpr int G = RPW8 * P <= 32 ? RPW8 : 32 / P, NG = RPW8 / G;  // rows a group: G x P sums <= a lane each
-    constexpr int NI = (T * PR + Q32_THREADS - 1) / Q32_THREADS;     // part rows a thread
+    constexpr int W = QL ? 4 : 1, PW = PR / W;                       // part rows a read, reads a token
+    constexpr int NI = (T * PW + Q32_THREADS - 1) / Q32_THREADS;     // reads a thread
+    static_assert(LR % 4 == 0 && HC == 4, "the inject rows: part's last row quad");
     static_assert(Q32_WARPS * 2 == Q32_COLS && T * HC <= Q32_THREADS, "geometry");
     __shared__ __align__(16) float lo[T][LR];
     __shared__ float rsS[T][HC], gwS[T][HC];
@@ -2524,16 +2527,27 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_v2_kernel(GrMulti m, con
 #pragma unroll
     for (int j = 0; j < Q8_CPS; ++j) ss += ssg[sk * Q8_NKC + sc * Q8_CPS + j];
     const float ipv = tok_sel<T>(m, sk, [](const FusedGrArgs& a) { return a.apply ? a.inj_prev : a.R; })[sc];
-    float pp[NI][HC];
+    float pp[NI][HC][W];
 #pragma unroll
     for (int n = 0; n < NI; ++n) {
-        const int i = t + n * Q32_THREADS, ic = i < T * PR ? i : 0, k = ic / PR, r = ic - k * PR;
+        const int i = t + n * Q32_THREADS, ic = i < T * PW ? i : 0, k = ic / PW, r = (ic - k * PW) * W;
 #pragma unroll
         for (int c = 0; c < HC; ++c) {
-            float p = 0.0f;
+            float p[W];
 #pragma unroll
-            for (int j = 0; j < Q8_CPS; ++j) p += part[((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r];
-            pp[n][c] = p;
+            for (int e = 0; e < W; ++e) p[e] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < Q8_CPS; ++j) {
+                const float* src = part + ((size_t) k * Q8_NKC + c * Q8_CPS + j) * PR + r;
+                if constexpr (QL) {
+                    const float4 v = *reinterpret_cast<const float4*>(src);
+                    p[0] += v.x; p[1] += v.y; p[2] += v.z; p[3] += v.w;
+                } else {
+                    p[0] += *src;
+                }
+            }
+#pragma unroll
+            for (int e = 0; e < W; ++e) pp[n][c][e] = p[e];
         }
     }
     // ... this lane's (row, token)s' R, w_norm and pending write ...
@@ -2573,16 +2587,25 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_v2_kernel(GrMulti m, con
     gr_sync_lds();
 #pragma unroll
     for (int n = 0; n < NI; ++n) {
-        const int i = t + n * Q32_THREADS, k = i / PR, r = i - k * PR;
-        if (i >= T * PR || (r >= LR && !inj_rows)) continue;
-        float sum = 0.0f;
+        const int i = t + n * Q32_THREADS, k = i / PW, r = (i - k * PW) * W;
+        if (i >= T * PW || (r >= LR && !inj_rows)) continue;
+        float sum[W];
 #pragma unroll
-        for (int c = 0; c < HC; ++c) sum = fmaf(rsS[k][c], pp[n][c], sum);
+        for (int e = 0; e < W; ++e) {
+            sum[e] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) sum[e] = fmaf(rsS[k][c], pp[n][c][e], sum[e]);
+        }
         if (r < LR) {
-            const float x = sum / (float) HC;
-            lo[k][r] = x / (1.0f + __expf(-x));
+#pragma unroll
+            for (int e = 0; e < W; ++e) {
+                const float x = sum[e] / (float) HC;
+                lo[k][r + e] = x / (1.0f + __expf(-x));
+            }
         } else {
-            tok_sel<T>(m, k, [](const FusedGrArgs& a) { return a.inject_out; })[r - LR] = sum;
+            float* io = tok_sel<T>(m, k, [](const FusedGrArgs& a) { return a.inject_out; });
+#pragma unroll
+            for (int e = 0; e < W; ++e) io[r - LR + e] = sum[e];
         }
     }
     gr_sync_lds();
@@ -2666,7 +2689,9 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
 #if !STRATA_GR_FAST_BUILD
     if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
         if (v2) {
-            gr_up_q8_v2_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            // (the quad reads measured slower at T = 7, 8)
+            if (T <= 6 && ((uintptr_t) part & 15) == 0) gr_up_q8_v2_kernel<T, T <= 6><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            else gr_up_q8_v2_kernel<T, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         } else if (ts) gr_up_q8_q32_kernel<T, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         else gr_up_q8_q32_kernel<T, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         return;
