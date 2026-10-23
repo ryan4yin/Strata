@@ -889,6 +889,42 @@ void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, 
     check("copy_row_to_first");
 }
 
+namespace {
+__global__ void mtp_pair_pick_rows_kernel(const int32_t* __restrict__ row_a, const int32_t* __restrict__ row_b,
+                                          const float* __restrict__ R_a, const float* __restrict__ R_b,
+                                          float* __restrict__ R_out, int64_t R_stride,
+                                          const float* __restrict__ inj_a, const float* __restrict__ inj_b,
+                                          float* __restrict__ inj_out, int64_t inj_stride,
+                                          const float* __restrict__ mixed_a, const float* __restrict__ mixed_b,
+                                          float* __restrict__ mixed_out, int64_t mixed_stride) {
+    const int r = int(blockIdx.y);
+    const int64_t row = r == 0 ? *row_a : *row_b;
+    const float* srcR = r == 0 ? R_a : R_b;
+    const float* srcI = r == 0 ? inj_a : inj_b;
+    const float* srcM = r == 0 ? mixed_a : mixed_b;
+    float* dstR = R_out + (size_t) r * (size_t) R_stride;
+    float* dstI = inj_out + (size_t) r * (size_t) inj_stride;
+    float* dstM = mixed_out + (size_t) r * (size_t) mixed_stride;
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x, st = (int64_t) gridDim.x * blockDim.x;
+    for (int64_t i = i0; i < R_stride; i += st) dstR[i] = srcR[row * R_stride + i];
+    for (int64_t i = i0; i < inj_stride; i += st) dstI[i] = srcI[row * inj_stride + i];
+    for (int64_t i = i0; i < mixed_stride; i += st) dstM[i] = srcM[row * mixed_stride + i];
+}
+}  // namespace
+
+void mtp_pair_pick_rows(const int32_t* row_a, const int32_t* row_b,
+                        const float* R_a, const float* R_b, float* R_out, int64_t R_stride,
+                        const float* inj_a, const float* inj_b, float* inj_out, int64_t inj_stride,
+                        const float* mixed_a, const float* mixed_b, float* mixed_out, int64_t mixed_stride,
+                        void* stream) {
+    const int64_t most = std::max(R_stride, std::max(inj_stride, mixed_stride));
+    const unsigned bx = (unsigned) ((most + 255) / 256 < 64 ? (most + 255) / 256 : 64);
+    mtp_pair_pick_rows_kernel<<<dim3(bx < 1 ? 1 : bx, 2), 256, 0, (cudaStream_t) stream>>>(
+        row_a, row_b, R_a, R_b, R_out, R_stride, inj_a, inj_b, inj_out, inj_stride, mixed_a, mixed_b, mixed_out,
+        mixed_stride);
+    check("mtp_pair_pick_rows");
+}
+
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,

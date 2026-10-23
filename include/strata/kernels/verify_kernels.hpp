@@ -205,6 +205,14 @@ void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
 /// row 0).  Graph-capturable: the row is read on the device.
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
                        void* stream);
+/// STRATA_FUSE_DRAFTPAIR_ROUND: gather two draft rounds' selected row (each row index is read on the device) into
+/// two contiguous rows: out row r gets src_r[*row_r] for R (n_embd*hc), the injection (hc) and the mixed vector
+/// (n_embd).  A byte-for-byte copy, one launch for both rows.
+void mtp_pair_pick_rows(const int32_t* row_a, const int32_t* row_b,
+                        const float* R_a, const float* R_b, float* R_out, int64_t R_stride,
+                        const float* inj_a, const float* inj_b, float* inj_out, int64_t inj_stride,
+                        const float* mixed_a, const float* mixed_b, float* mixed_out, int64_t mixed_stride,
+                        void* stream);
 /// dst row i = src row ids[i] (row_bytes each, multiple of 16), for n rows.
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
