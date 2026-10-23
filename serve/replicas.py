@@ -29,7 +29,9 @@ session restore (`.map`) puts a conversation back on the card whose saved state 
 collide (agent sessions share their first message), which is why the name never decides alone.
 
 CPU cores.  On Linux the replicas get disjoint physical cores (serve/cpu_affinity.py, from PR #1436 by agorevski), so
-the host threads of the engines (the expert workers) do not compete.  "replica_cpus": false turns it off.
+the host threads of the engines (the expert workers) do not compete.  "replica_cpus": false turns it off.  It also
+takes one explicit CPU list per replica, e.g. "replica_cpus": [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7, 12, 13,
+14, 15]], for a hybrid P/E machine where the automatic contiguous split gives each replica a different mix of cores.
 """
 from __future__ import annotations
 
@@ -159,9 +161,50 @@ def replica_cfg(cfg: dict, i: int, gpus: list[int]) -> dict:
     return c
 
 
-def cpu_sets(n: int, enabled: bool = True):
+def _explicit_cpu_sets(n: int, spec) -> list[list[int]]:
+    """Validate explicit per-replica CPU lists: exactly one non-empty list per replica, no CPU in two lists, and every
+    CPU in the process's sched_getaffinity (an engine cannot use a CPU this process may not run on).  The order in each
+    list is kept; the kernel accepts it as an affinity mask and the caller passes it unchanged to each engine."""
+    if not isinstance(spec, (list, tuple)):
+        raise ReplicaConfigError(f'"replica_cpus" must be true, false, or one CPU list per replica, not {spec!r}')
+    if len(spec) != n:
+        raise ReplicaConfigError(f'"replica_cpus" needs one CPU list for each of the {n} replicas, but got '
+                                 f'{len(spec)} list(s)')
+    if not hasattr(os, "sched_getaffinity"):
+        raise ReplicaConfigError('"replica_cpus" CPU lists need sched_getaffinity (Linux) to validate the CPUs')
+    allowed = set(os.sched_getaffinity(0))
+    seen: dict[int, int] = {}
+    result: list[list[int]] = []
+    for i, cpus in enumerate(spec):
+        if not isinstance(cpus, (list, tuple)):
+            raise ReplicaConfigError(f'"replica_cpus"[{i}] must be a list of CPU numbers, not {cpus!r}')
+        if not cpus:
+            raise ReplicaConfigError(f'"replica_cpus"[{i}] is empty: each replica needs at least one CPU')
+        group: list[int] = []
+        for cpu in cpus:
+            if isinstance(cpu, bool) or not isinstance(cpu, int):
+                raise ReplicaConfigError(f'"replica_cpus"[{i}] has {cpu!r}; every entry must be a CPU number')
+            if cpu not in allowed:
+                raise ReplicaConfigError(f'"replica_cpus"[{i}] has CPU {cpu}, which is not in this process\'s '
+                                         f'sched_getaffinity; allowed CPUs: {sorted(allowed)}')
+            if cpu in seen:
+                if seen[cpu] == i:
+                    raise ReplicaConfigError(f'"replica_cpus"[{i}] lists CPU {cpu} more than once')
+                raise ReplicaConfigError(f'CPU {cpu} is in both replica {seen[cpu]} and replica {i}; '
+                                         'replica CPU lists must not overlap')
+            seen[cpu] = i
+            group.append(cpu)
+        result.append(group)
+    return result
+
+
+def cpu_sets(n: int, enabled: bool | list[list[int]] | None = True):
     """n disjoint sets of CPUs (whole physical cores, SMT siblings together), or None (off, not Linux, or the topology
-    cannot be read: the engines then share the cores as they would without replicas)."""
+    cannot be read: the engines then share the cores as they would without replicas).  An explicit list of CPU lists
+    (one per replica) is returned after validation; it is meant for hybrid P/E machines where the automatic split's
+    contiguous slices would give replicas different P/E mixes."""
+    if isinstance(enabled, (list, tuple)):
+        return _explicit_cpu_sets(n, enabled)
     if not enabled or n < 2 or not hasattr(os, "sched_getaffinity"):
         return None
     try:
