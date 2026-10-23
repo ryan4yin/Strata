@@ -205,9 +205,11 @@ int main(int argc, char** argv) {
                 for (uint32_t u : ha) { float f; std::memcpy(&f, &u, 4); if (!std::isfinite(f)) ++nonfinite; }
                 if (!ba || !b_1 || nonfinite) ++bad;
                 if (T == 1) { a1 = ta; b1 = tb; }
-                std::printf("%-18s %4d %9.4f %9.4f %8.4f %8.4f  %s %s %s%s\n", c.name, T, ta, tb,
+                uint64_t hsh = 1469598103934665603ull;   // FNV-1a of A's outputs: equal across builds = bitwise across builds
+                for (uint32_t u : ha) hsh = (hsh ^ u) * 1099511628211ull;
+                std::printf("%-18s %4d %9.4f %9.4f %8.4f %8.4f  %s %s %s%s  hash %016llx\n", c.name, T, ta, tb,
                             T > 1 ? (ta - a1) / (T - 1) : 0.0, T > 1 ? (tb - b1) / (T - 1) : 0.0, ba ? "ok" : "DIFF",
-                            a_1 ? "ok" : "diff", b_1 ? "ok" : "DIFF", nonfinite ? " NONFINITE" : "");
+                            a_1 ? "ok" : "diff", b_1 ? "ok" : "DIFF", nonfinite ? " NONFINITE" : "", (unsigned long long) hsh);
             }
             for (void* d : b.w) cudaFree(d);
             cudaFree(b.xq); cudaFree(b.xf); cudaFree(b.y); cudaFree(ya); cudaFree(yb); cudaFree(y1);

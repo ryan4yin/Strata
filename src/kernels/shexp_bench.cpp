@@ -164,7 +164,11 @@ int main(int argc, char** argv) {
                 if (r >= 3) t.push_back(ms);
             }
             std::nth_element(t.begin(), t.begin() + t.size() / 2, t.end());
-            std::printf("%-22s %4d %9.3f  %s\n", c.name, T, 1000.0 * t[t.size() / 2] / kCalls, same ? "ok" : "DIFF");
+            uint64_t hsh = 1469598103934665603ull;   // FNV-1a of the outputs: equal across builds = bitwise across builds
+            for (uint32_t u : a) hsh = (hsh ^ u) * 1099511628211ull;
+            if (c.pair) for (uint32_t u : b) hsh = (hsh ^ u) * 1099511628211ull;
+            std::printf("%-22s %4d %9.3f  %s  hash %016llx\n", c.name, T, 1000.0 * t[t.size() / 2] / kCalls, same ? "ok" : "DIFF",
+                        (unsigned long long) hsh);
             cudaGraphExecDestroy(ge);
             cudaGraphDestroy(g);
         }
