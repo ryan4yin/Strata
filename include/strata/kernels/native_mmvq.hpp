@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -164,6 +165,16 @@ bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const v
 /// exact native_mmvq_multi_kernel<F, n, 4, 2>; bitwise the two calls.  false: nothing launched.
 bool native_mmvq_pair_mixed(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                             int n_in, int n_out, int ncols, void* stream);
+/// STRATA_FUSE_SHBEL=1 (HIP): the shared expert's gate/up pair (native_mmvq_pair's one launch) and the window's
+/// native_router_top10_multi_bell (native_router.hpp: its arguments logits .. seq) in ONE launch.  Block 0 is the router
+/// and fires the bell as soon as its top-10 is done; the pair's blocks (block prefix 1, 2 * ceil(n_out / 2) of them) never
+/// wait for it.  The same bytes as the two calls: y1/y2, ids/weights, the published rows and ids, and the ring.  The pair
+/// must be the one native_mmvq_pair / native_mmvq_pair_mixed would launch (2-8 columns, n_out even, the same rows-mode
+/// and pair-kind conditions); false: nothing launched, the caller makes the two calls.
+bool native_mmvq_pair_router_bell(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1, float* y1,
+                                  float* y2, int n_in, int n_out, int ncols, const float* logits, int32_t* ids,
+                                  float* weights, int n_tok, const float* x, const int32_t* d_res, int n_expert, int64_t n,
+                                  int64_t k, float* x_out, int32_t* ids_out, uint32_t* seq, void* stream);
 /// STRATA_FUSE_PROJ=1 (native_mmvq_proj_on(); HIP): native_mmvq(seg.type, seg.w -> seg.y, n_in, seg.n_out, ncols) for
 /// 2-4 matrices of one input in one launch, bitwise those calls.  So far Q6_K only, 1-4 columns (every segment's rows
 /// by q6k_v2_kernel's code).  false: nothing launched (the caller makes the calls).
