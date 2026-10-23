@@ -3,6 +3,7 @@
 // random inputs (GPU, synthetic, no model).  Exit 0 when all match.
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -447,6 +448,64 @@ int test_pair_routebell(std::mt19937& rng, cudaStream_t s) {
     return bad + declined + (cases == 0);
 }
 
+// STRATA_FUSE_QGEMV: bf16_gemv_fp32_mmvf_multi_quant vs the router's GEMV (with and without the shared-gate aux row)
+// then native_quantize_q8_1: every GEMV output and every q8_1 byte.
+int test_qgemv(std::mt19937& rng, cudaStream_t s) {
+    using namespace strata::kernels;
+    const int N = 2560, NO = 512;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto make_w = [&](int rows) {
+        std::vector<uint16_t> w((size_t) rows * N);
+        for (auto& v : w) v = (uint16_t) (rng() & 0x3fff) | ((rng() & 1) << 15);
+        uint16_t* d = dev<uint16_t>(w.size());
+        up(d, w);
+        return d;
+    };
+    uint16_t* w = make_w(NO);
+    uint16_t* wa = make_w(1);
+    int bad = 0, cases = 0, declined = 0;
+    for (int nc = 2; nc <= 8; ++nc) {
+        for (const int aux : {0, 1}) {
+            std::vector<float> x((size_t) nc * N);
+            for (auto& v : x) v = nd(rng);
+            float* dx = dev<float>(x.size());
+            up(dx, x);
+            const size_t no = (size_t) nc * NO, nq = (size_t) nc * (N / 32) * 36;
+            float *yr = dev<float>(no), *yf = dev<float>(no), *ar = dev<float>(nc), *af = dev<float>(nc);
+            uint8_t* qr = dev<uint8_t>(nq + 64);
+            uint8_t* qf = dev<uint8_t>(nq + 64);
+            for (float* o : {yr, yf}) check(cudaMemset(o, 0x3c, no * 4), "memset");
+            for (float* o : {ar, af}) check(cudaMemset(o, 0x3c, nc * 4), "memset");
+            check(cudaMemset(qr, 0x5a, nq + 64), "memset");
+            check(cudaMemset(qf, 0x5a, nq + 64), "memset");
+            if (aux) bf16_gemv_fp32_mmvf_multi_aux(dx, N, w, yr, NO, N, NO, nc, wa, ar, 1, s);
+            else bf16_gemv_fp32_mmvf_multi(dx, N, w, yr, NO, N, NO, nc, s);
+            native_quantize_q8_1(dx, qr, N, nc, s);
+            const bool f = bf16_gemv_fp32_mmvf_multi_quant(dx, N, w, yf, NO, N, NO, nc, aux ? wa : nullptr,
+                                                            aux ? af : nullptr, aux ? 1 : 0, dx, qf, (int64_t) nc * N, s);
+            check(cudaStreamSynchronize(s), "sync");
+            ++cases;
+            if (!f) {
+                std::printf("    *** qgemv %d columns aux %d: declined ***\n", nc, aux);
+                ++declined;
+            } else {
+                const auto y1 = down(yr, no), y2 = down(yf, no);
+                const auto a1 = down(ar, (size_t) nc), a2 = down(af, (size_t) nc);
+                const auto b1 = down(qr, nq + 64), b2 = down(qf, nq + 64);
+                if (!same(y1, y2) || (aux && !same(a1, a2)) || !same(b1, b2)) {
+                    std::printf("    *** qgemv %d columns aux %d differs ***\n", nc, aux);
+                    ++bad;
+                }
+            }
+            cudaFree(dx); cudaFree(yr); cudaFree(yf); cudaFree(ar); cudaFree(af); cudaFree(qr); cudaFree(qf);
+        }
+    }
+    cudaFree(w); cudaFree(wa);
+    std::printf("  %-60s %s (%d cases, %d declined)\n", "STRATA_FUSE_QGEMV router GEMV + q8_1 == GEMV + quantize",
+                bad || declined || cases == 0 ? "*** NO ***" : "bitwise", cases, declined);
+    return bad + declined + (cases == 0);
+}
+
 // strict: every byte; nan_cases: also NaN inputs, where two NaN operands meet in one add and the hardware keeps one
 // of their sign / payload bits by operand order, which the compiler may commute: a NaN result must stay a NaN there
 bool g_nan = false;
@@ -578,6 +637,7 @@ int main(int argc, char** argv) {
     if (only.empty() || only == "fetch") bad += test_fetch(rng, s);
     if (only.empty() || only == "pair") bad += test_pair(rng, s);
     if (only.empty() || only == "pairbell") bad += test_pair_routebell(rng, s);
+    if (only.empty() || only == "qgemv") bad += test_qgemv(rng, s);
     if (only.empty() || only == "plan") bad += test_plan(rng, s);
     if (only.empty() || only == "combine") {
         for (const bool gated : {false, true}) {
