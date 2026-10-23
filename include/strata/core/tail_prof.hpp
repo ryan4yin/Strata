@@ -38,7 +38,8 @@ struct TailProf {
     double ms[kN] = {};
     long long windows = 0;
     long long ple_checked = 0, ple_bad = 0;   // STRATA_DBG_PLECHECK: gathered PLE rows re-read and compared
-    long long pair_rounds = 0, draft_checked = 0, draft_bad = 0;   // STRATA_FUSE_DRAFTHEAD / STRATA_DBG_DRAFTCHECK
+    long long pair_rounds = 0, draft_checked = 0, draft_bad = 0;
+    long long early_rounds = 0, early_bad = 0;   // STRATA_FUSE_DRAFTEARLY: pairs launched before the commit, mispredicted   // STRATA_FUSE_DRAFTHEAD / STRATA_DBG_DRAFTCHECK
     static bool ple_check() {
         static const bool v = [] { const char* e = std::getenv("STRATA_DBG_PLECHECK"); return e != nullptr && e[0] == '1'; }();
         return v;
