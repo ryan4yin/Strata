@@ -188,17 +188,21 @@ __global__ void __launch_bounds__(S) gdn_conv_groups_kernel(GdnConvGroups gr, co
                                                             const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
                                                             const float* __restrict__ dt, const float* __restrict__ ssm_a,
                                                             float* __restrict__ gate, float* __restrict__ beta, int n, int h_v,
-                                                            int T) {
+                                                            int T, int conv_blocks) {
+    // one-dimensional grid: the a/b blocks first, then row r's conv blocks at ab_blocks + r * conv_blocks.  The 2-D
+    // grid (conv + a/b blocks, rows) it replaces took 18.4 us at exactly 4 rows on gfx1201 (6.3 us like this; 2, 6, 7,
+    // 8 rows the same either way) - the same blocks, only their order of dispatch
     const int ab_blocks = AB ? (2 * h_v + 1) / 2 : 0;
-    if ((int) blockIdx.x >= ab_blocks) {
-        const int r = blockIdx.y;
+    int ab = -1, bx = 0, r = 0;
+    if ((int) blockIdx.x < ab_blocks) ab = blockIdx.x;
+    else { const int i = (int) blockIdx.x - ab_blocks; r = i / conv_blocks; bx = i % conv_blocks; }
+    if (ab < 0) {
         int g = 0;
         while (g + 1 < gr.n && r >= gr.first[g + 1]) ++g;
         const size_t off = (size_t) gr.first[g] * C;
-        gdn_conv_l2_body((int) blockIdx.x - ab_blocks, r - gr.first[g], gr.hist[g], qkv + off, w, h + off, C, qk_heads, eps, 0,
-                         commit);
-    } else if (AB && blockIdx.y == 0 && threadIdx.x < 64) {
-        gdn_ab_body<MAX_T, EXACT_T>((int) blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
+        gdn_conv_l2_body(bx, r - gr.first[g], gr.hist[g], qkv + off, w, h + off, C, qk_heads, eps, 0, commit);
+    } else if (AB && threadIdx.x < 64) {
+        gdn_ab_body<MAX_T, EXACT_T>(ab, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
     }
 }
 
@@ -1196,10 +1200,10 @@ void gdn_conv_groups(const GdnConvGroups& gr, const float* qkv, const float* con
         std::exit(1);
     }
     const int conv_blocks = channels / S, ab_blocks = x ? (2 * h_v + 1) / 2 : 0;
-    const dim3 grid((unsigned) (conv_blocks + ab_blocks), (unsigned) rows);
+    const dim3 grid((unsigned) (ab_blocks + rows * conv_blocks));
     cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_CONV_GROUPS(MT, EX, AB) gdn_conv_groups_kernel<MT, EX, AB><<<grid, S, 0, st>>>(gr, qkv, conv_w, h, channels, \
-        qk_heads, eps, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, rows)
+        qk_heads, eps, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, rows, conv_blocks)
     if (!x) STRATA_CONV_GROUPS(1, true, false);
     else switch (rows) {
         case 1: STRATA_CONV_GROUPS(1, true, true); break;
