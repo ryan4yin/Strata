@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
     if (!ck(cudaGetDeviceCount(&n_dev), "device count")) return 1;
     const int only = argc > 2 ? std::atoi(argv[2]) : -1;
     const int bmode = argc > 3 ? std::atoi(argv[3]) : -1;
-    const int bv2 = [] { const char* v = std::getenv("STRATA_BENCH_V2"); return v != nullptr && v[0] == '1' ? 1 : 0; }();   // B: STRATA_Q6K_V2
+    const int bv2 = [] { const char* v = std::getenv("STRATA_BENCH_V2"); return v != nullptr ? std::atoi(v) : 0; }();   // B: STRATA_Q6K_V2
     long long bad = 0;
     for (int dev = 0; dev < n_dev; ++dev) {
         if (only >= 0 && dev != only) continue;
