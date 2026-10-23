@@ -88,10 +88,10 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
 
 // COPY (fuse-gdn, STRATA_FUSE_KVRESOLVE): the same block then copies the missed blocks itself (copy_kernel's bytes),
 // so the copy needs no launch of its own and no block waits for another
-template <bool COPY = false>
-__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
-                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
-                                                     Runs r = {}) {
+template <bool COPY>
+__device__ __forceinline__ void resolve_body(const KvStreamMap& m, const int32_t* __restrict__ ids,
+                                             const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
+                                             const Runs& r) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -181,8 +181,30 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     }
 }
 
+template <bool COPY = false>
+__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
+                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
+                                                     Runs r = {}) {
+    resolve_body<COPY>(m, ids, steps, n_q, cap, page_size, r);
+}
+
+// fuse-gdn (STRATA_FUSE_QSAWAVE): one block per row of a wave, each its own map (different slots' layers), the row's
+// selection at ids + row * cap and its step at steps + row * kStepCount - the per-row resolve_kernel calls' work
+struct ResolveRows {
+    KvStreamMap m[KvResolveRows::kMax];
+    Runs r[KvResolveRows::kMax];
+    int row[KvResolveRows::kMax];
+};
+template <bool COPY>
+__global__ void __launch_bounds__(RT) resolve_rows_kernel(ResolveRows rr, const int32_t* __restrict__ ids,
+                                                          const int32_t* __restrict__ steps, int cap, int page_size) {
+    const int z = blockIdx.x, row = rr.row[z];
+    resolve_body<COPY>(rr.m[z], ids + (long long) row * cap, steps + (long long) row * kStepCount, 1, cap, page_size,
+                       rr.r[z]);
+}
+
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__device__ __forceinline__ void copy_body(const KvStreamMap& m, const Runs& r) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
@@ -193,6 +215,9 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
         }
     }
 }
+__global__ void copy_kernel(KvStreamMap m, Runs r) { copy_body(m, r); }
+// the rows' copies: blockIdx.y = the row (its map and runs), blockIdx.x as copy_kernel's
+__global__ void copy_rows_kernel(ResolveRows rr) { copy_body(rr.m[blockIdx.y], rr.r[blockIdx.y]); }
 
 __global__ void reset_kernel(KvStreamMap m) {
     const long long i0 = (long long) blockIdx.x * blockDim.x + threadIdx.x, st = (long long) gridDim.x * blockDim.x;
@@ -231,8 +256,12 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream) {
-    static const bool fused = [] { const char* v = std::getenv("STRATA_FUSE_KVRESOLVE"); return v != nullptr && std::atoi(v) != 0; }();
-    kv_stream_resolve_with(m, slots, host, fmt, ids, steps, n_q, cap, s, stream, fused);
+    kv_stream_resolve_with(m, slots, host, fmt, ids, steps, n_q, cap, s, stream, kv_stream_fuse_copy_on());
+}
+
+bool kv_stream_fuse_copy_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_KVRESOLVE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
 }
 
 void kv_stream_resolve_with(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
@@ -261,6 +290,43 @@ void kv_stream_resolve_with(const KvStreamMap& m, const QsaAttnPools& slots, con
     check("resolve");
     copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
+}
+
+void kv_stream_resolve_rows(const KvResolveRows& rows, int fmt, const int32_t* ids, const int32_t* steps, int64_t cap,
+                            const QsaShapes& s, void* stream, bool fused_copy) {
+    if (rows.n <= 0) return;
+    if (rows.n > KvResolveRows::kMax) {
+        std::fprintf(stderr, "kv_stream: kv_stream_resolve_rows: %d rows (at most %d)\n", rows.n, KvResolveRows::kMax);
+        std::exit(1);
+    }
+    if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
+        std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
+        std::exit(1);
+    }
+    ResolveRows rr{};
+    for (int z = 0; z < rows.n; ++z) {
+        if (rows.m[z].n_slots < RT) {   // as kv_stream_resolve
+            std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d)\n", (long long) rows.m[z].n_slots, RT);
+            std::exit(1);
+        }
+        for (int y = 0; y < z; ++y)
+            if (rows.m[y].ctl == rows.m[z].ctl) {   // one map twice: the calls would race (the rows' order matters)
+                std::fprintf(stderr, "kv_stream: kv_stream_resolve_rows: rows %d and %d share a map\n", y, z);
+                std::exit(1);
+            }
+        rr.m[z] = rows.m[z];
+        rr.r[z] = runs_of(rows.slots[z], rows.host[z], fmt, s);
+        rr.row[z] = rows.row[z];
+    }
+    if (fused_copy) {
+        resolve_rows_kernel<true><<<rows.n, RT, 0, (cudaStream_t) stream>>>(rr, ids, steps, (int) cap, (int) s.page_size);
+        check("resolve rows + copy");
+        return;
+    }
+    resolve_rows_kernel<false><<<rows.n, RT, 0, (cudaStream_t) stream>>>(rr, ids, steps, (int) cap, (int) s.page_size);
+    check("resolve rows");
+    copy_rows_kernel<<<dim3(96, rows.n), 128, 0, (cudaStream_t) stream>>>(rr);
+    check("copy rows");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
