@@ -156,6 +156,11 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 /// native_mmvq_pair with the K-quant / IQ4_XS pairs whatever STRATA_FUSE_SHPAIR says (the caller's own switch decides).
 bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                           int n_in, int n_out, int ncols, void* stream);
+/// STRATA_FUSE_SHPAIR=1 (HIP): native_mmvq(type1, w1 -> y1) and native_mmvq(type2, w2 -> y2) of two formats (Q4_K /
+/// Q5_K / Q6_K / IQ4_XS), one shape and input, in one launch where each would run b6_mmvq_rows_kernel<F, n, 2> or the
+/// exact native_mmvq_multi_kernel<F, n, 4, 2>; bitwise the two calls.  false: nothing launched.
+bool native_mmvq_pair_mixed(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                            int n_in, int n_out, int ncols, void* stream);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
