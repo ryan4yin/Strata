@@ -482,6 +482,34 @@ bool fuse_convab_on() {
 #endif
 }
 
+// fuse-gdn: STRATA_FUSE_BCOMMIT=1 - the batch commit graph's GDN commits and QSA indexer appends one launch per slot over
+// all of the slot's layers (gdn_commit_layers / native_qsa_indexer_append_steps_layers, bitwise the per-layer calls)
+bool fuse_bcommit_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_BCOMMIT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// fuse-gdn: STRATA_FUSE_GDNCONV=1 - a batch window's GDN conv of every slot group in one launch per layer (gdn_conv_groups);
+// =2 also the a/b projections in that launch (where the window computes them on the main stream right after)
+int fuse_gdnconv_level() {
+    static const int lv = [] { const char* v = std::getenv("STRATA_FUSE_GDNCONV"); return v != nullptr ? std::atoi(v) : 0; }();
+    return lv;
+}
+
+// fuse-gdn: STRATA_FUSE_IDXAPP=1 - a batch window's indexer tail snapshots and key appends one launch per QSA layer
+// (native_qsa_indexer_append_slots: one block per slot group, bitwise the per-row appends)
+bool fuse_idxapp_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_IDXAPP"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// fuse-gdn: STRATA_FUSE_QSASEL=1 - a batch window's per-row QSA path (KV streaming) scores and selects every row in
+// one launch each before the rows' resolve + attention (qsa_block_scores_slots, qsa_block_topk over the rows)
+bool fuse_qsasel_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_QSASEL"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
 #if defined(STRATA_USE_HIP)
@@ -1602,6 +1630,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
+                // STRATA_FUSE_GDNCONV: the slot groups' convs (=2: and the a/b projections) in one launch
+                bool conv_grouped = false, ab_done = false;
+                if (batch_rec_ && fuse_gdnconv_level() >= 1 && te - tb <= strata::kernels::kVerifyMaxT) {
+                    strata::kernels::GdnConvGroups cg;
+                    for (int t = tb; t < te && cg.n < 8;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        SessionState& sx = slot_ss(first);
+                        cg.hist[cg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                        (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        cg.first[cg.n] = first - tb;
+                        cg.ntok[cg.n] = t - first;
+                        ++cg.n;
+                        conv_grouped = t == te;
+                    }
+                    for (int i = 0; conv_grouped && keep_rows && i < cg.n; ++i)   // committing groups: one per slot
+                        for (int j = 0; j < i; ++j) conv_grouped = conv_grouped && cg.hist[i] != cg.hist[j];
+                    if (conv_grouped) {
+                        ab_done = fuse_gdnconv_level() >= 2 && !br && !sidem && !prof_on_;
+                        strata::kernels::gdn_conv_groups(cg, qkv + (size_t) tb * C, (const float*) wc->data, hb + (size_t) tb * C,
+                                                         (int) C, (int) (2 * HK), EPS, keep_rows, ab_done ? xm : nullptr,
+                                                         (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                                                         (const float*) wdt->data, (const float*) wsa->data,
+                                                         gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV, cs);
+                    }
+                }
+                if (conv_grouped) {
+                } else
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -1628,7 +1684,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     join(0);
                     join(1);
                 } else {
-                if (!fuse_ab && !sidem)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
+                if (!fuse_ab && !sidem && !ab_done)   // the gates: a fused conv kernel (143-amdk, fuse-gdn) or the side mixer's branch, else here
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
@@ -1764,7 +1820,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
                 };
+                // STRATA_FUSE_IDXAPP: a batch window's snapshots + appends in one launch (idx_append), when every
+                // slot group fits and has its own indexer buffers
+                QsaIndexerSlots idx_slots;
+                bool idx_fused = batch_rec_ && fuse_idxapp_on();
+                for (int t = tb; idx_fused && t < te;) {
+                    const int first = t;
+                    while (t < te && brow_[t] == brow_[first]) ++t;
+                    const QsaState& sx = slot_ss(first).qsa_states[qi];
+                    const int i = idx_slots.n;
+                    idx_fused = i < QsaIndexerSlots::kMax && sx.max_cells <= INT32_MAX;
+                    for (int j = 0; idx_fused && j < i; ++j) idx_fused = idx_slots.tail[j] != sx.idx_tail;
+                    if (!idx_fused) break;
+                    idx_slots.raw[i] = idx_raw + first * ID;
+                    idx_slots.pos[i] = step_ + first * kStepCount + kStepPos;
+                    idx_slots.n_steps[i] = t - first;
+                    idx_slots.snap[i] = keep_rows ? nullptr : tail_snap_b_ + ((size_t) brow_[first] * nQall + qi) * TS;
+                    idx_slots.tail[i] = sx.idx_tail; idx_slots.dead[i] = sx.idx_dead; idx_slots.pooled[i] = sx.idx_pooled;
+                    idx_slots.block_pos[i] = sx.idx_block_pos;
+                    idx_slots.max_cells[i] = (int) sx.max_cells;
+                    idx_slots.n = i + 1;
+                }
                 auto idx_snap = [&](cudaStream_t ns) {
+                    if (idx_fused) return;   // in idx_append's launch
                     if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
                         for (int t = tb; t < te && !keep_rows; ++t)
                             if (t == tb || brow_[t] != brow_[t - 1])
@@ -1774,6 +1852,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
+                    if (idx_fused) {
+                        native_qsa_indexer_append_slots(idx_slots, kStepCount, 0, (const float*) wikn->data, EPS, s,
+                                                        rope_scaling(), ns);
+                    } else
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
@@ -2008,12 +2090,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                       attn_ + t * NH * HD, 1, cs);
                     }
                 } else if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                    // STRATA_FUSE_QSASEL: the scores and the top-k of every row first, one launch each (they read the
+                    // indexer and write the row's own scores / sel; the resolves and attention below do not touch those)
+                    bool sel_done = false;
+                    if (fuse_qsasel_on() && te - tb <= kQsaAttnMaxSlots) {
+                        const float* pooled[kQsaAttnMaxSlots];
+                        const float* dead[kQsaAttnMaxSlots];
+                        for (int t = tb; t < te; ++t) {
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            pooled[t - tb] = sx.idx_pooled;
+                            dead[t - tb] = sx.idx_dead;
+                        }
+                        sel_done = qsa_block_scores_slots(pooled, dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, te - tb,
+                                                          max_blocks_, s, scores_ + (size_t) tb * max_blocks_, cs);
+                        if (sel_done)
+                            qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, te - tb, max_blocks_,
+                                           cap_, s, sel_ + (size_t) tb * cap_, cs);
+                    }
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        if (!sel_done) {
                         qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
                                          max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
                                        sel_ + (size_t) t * cap_, cs);
+                        }
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
@@ -3823,19 +3924,95 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
+        // in one launch for all slots; the conv commits stay per slot
+        static const bool gdn_groups_on = [] {
+            const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        bool one_row = S <= 8;
+        for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
+        // STRATA_FUSE_BCOMMIT=1: per slot, every GDN layer's conv + state commit in two launches and every QSA layer's
+        // tail restore + indexer append in one (the single-slot commit graph's kernels, each slot's rows and keep count);
+        // a slot or layer kind that does not fit keeps the per-layer loop below
+        bool gdn_fused = false, qsa_fused = false;
+        if (fuse_bcommit_on()) {
+            int64_t n_gdn = 0;
+            bool weights_ok = true;   // the loop's weight checks, kept
+            for (int64_t l = lb_; l < le_ && weights_ok; ++l)
+                weights_ok = need(LayerView(*wt_, l), is_qsa_layer(g, l) ? "indexer.k_norm.weight" : "ssm_norm.weight",
+                                  err) != nullptr;
+            for (int64_t l = lb_; l < le_; ++l) n_gdn += !is_qsa_layer(g, l);
+            if (!weights_ok) ok = false;
+            if (ok && n_gdn > 0 && !(gdn_groups_on && one_row)) {
+                bool all = true;
+                for (int t = 0; t < S && all;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    SessionState& sx = *slots_[(size_t) rows[first]];
+                    all = gdn_commit_layers(sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats,
+                                            (int64_t) gdn_floats,
+                                            (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                                            qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                                            h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                                            gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                                            beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV, MT * HV, (int) C,
+                                            (int) g.ssm_k_heads, (int) HV, t - first, (int) n_gdn,
+                                            commitb_ + (size_t) rows[first] * CB, cs_);
+                    if (!all && first > 0) throw std::runtime_error("gdn_commit_layers declined after a launch");
+                }
+                gdn_fused = all;
+            }
+            if (ok) {
+                // every slot's QSA layers in one launch each, when its layers all fit QsaIndexerLayers and share max_cells
+                std::vector<std::pair<QsaIndexerLayers, int64_t>> per;   // a slot group's layers and max_cells
+                bool fits = true;
+                for (int t = 0; t < S && fits;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    QsaIndexerLayers il;
+                    int nq = 0;
+                    int64_t mc = -1;
+                    for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                        if (!is_qsa_layer(g, l)) continue;
+                        const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qi];
+                        if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
+                        mc = st.max_cells;
+                        il.gamma[nq] = (const float*) need(LayerView(*wt_, l), "indexer.k_norm.weight", err)->data;
+                        il.tail_src[nq] = tail_snap_b_ + ((size_t) rows[first] * nQ + qi) * TS;
+                        il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                        il.block_pos[nq] = st.idx_block_pos;
+                        ++nq;
+                        ++qi;
+                    }
+                    per.emplace_back(il, nq > 0 ? mc : 0);
+                }
+                if (fits) {
+                    int k = 0;
+                    for (int t = 0; t < S; ++k) {
+                        const int first = t;
+                        while (t < S && rows[t] == rows[first]) ++t;
+                        int nq = 0;
+                        for (int64_t l = lb_; l < le_; ++l) nq += is_qsa_layer(g, l);
+                        if (nq > 0)
+                            native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) (qsa_index * MT + first) * ID, MT * ID,
+                                                                   commitb_ + (size_t) rows[first] * CB + 2, 1, t - first, 0,
+                                                                   EPS, per[(size_t) k].first, nq, s, per[(size_t) k].second,
+                                                                   rope_scaling(), cs_);
+                    }
+                    qsa_fused = true;
+                }
+            }
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (!is_qsa_layer(g, l) && gdn_fused) {
+                ++gdn_index;
+            } else if (is_qsa_layer(g, l) && qsa_fused) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
-                // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
-                // in one launch for all slots; the conv commits stay per slot
-                static const bool gdn_groups_on = [] {
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                bool one_row = S <= 8;
-                for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
                 strata::kernels::GdnGroups gg;
                 for (int t = 0; t < S;) {
                     const int first = t;

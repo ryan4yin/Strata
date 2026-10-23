@@ -181,6 +181,29 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_kernel(int conv_blocks, float* 
     }
 }
 
+// fuse-gdn (STRATA_FUSE_GDNCONV): every slot group's conv in one launch (blockIdx.y = the window row, its group found
+// from the row), with AB the a/b blocks first as in gdn_conv_ab_kernel; each block runs its own kernel's body unchanged
+template <int MAX_T, bool EXACT_T, bool AB>
+__global__ void __launch_bounds__(S) gdn_conv_groups_kernel(GdnConvGroups gr, const float* __restrict__ qkv,
+                                                            const float* __restrict__ w, float* __restrict__ h, int C,
+                                                            int qk_heads, float eps, bool commit, const float* __restrict__ x,
+                                                            const uint16_t* __restrict__ wa, const uint16_t* __restrict__ wb,
+                                                            const float* __restrict__ dt, const float* __restrict__ ssm_a,
+                                                            float* __restrict__ gate, float* __restrict__ beta, int n, int h_v,
+                                                            int T) {
+    const int ab_blocks = AB ? (2 * h_v + 1) / 2 : 0;
+    if ((int) blockIdx.x >= ab_blocks) {
+        const int r = blockIdx.y;
+        int g = 0;
+        while (g + 1 < gr.n && r >= gr.first[g + 1]) ++g;
+        const size_t off = (size_t) gr.first[g] * C;
+        gdn_conv_l2_body((int) blockIdx.x - ab_blocks, r - gr.first[g], gr.hist[g], qkv + off, w, h + off, C, qk_heads, eps, 0,
+                         commit);
+    } else if (AB && blockIdx.y == 0 && threadIdx.x < 64) {
+        gdn_ab_body<MAX_T, EXACT_T>((int) blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
+    }
+}
+
 // State-only commit kernel: each head's 128 independent state columns are split across 4 blocks of 32 columns
 // (48 * 4 = 192 blocks of 128 threads across all SMs, vs 48 blocks of 512 threads), with no sq/o/norm/z/y work.
 // DBG (STRATA_DBG_GDN=1, #937): a window count the launch never allowed (n_keep is read from device memory; n_max is the
@@ -1143,6 +1166,38 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
         default: gdn_conv_ab_kernel<kVerifyMaxT, false><<<grid, S, 0, st>>>(conv_blocks, hist, qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
     }
     check("gdn_conv_ab_multi");
+}
+
+void gdn_conv_groups(const GdnConvGroups& gr, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                     float eps, bool commit, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
+                     const float* dt, const float* ssm_a, float* gate, float* beta, int n_embd, int h_v, void* stream) {
+    int rows = 0;
+    bool ok = gr.n >= 1 && gr.n <= 8 && qkv && conv_w && h && channels % S == 0 && (!x || n_embd % 8 == 0);
+    for (int i = 0; ok && i < gr.n; ++i) {
+        ok = gr.hist[i] && gr.first[i] == rows && gr.ntok[i] >= 1 && (!commit || gr.ntok[i] == 1);
+        rows += gr.ntok[i];
+    }
+    if (!ok || rows > kVerifyMaxT) {
+        std::fprintf(stderr, "gdn_conv_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    const int conv_blocks = channels / S, ab_blocks = x ? (2 * h_v + 1) / 2 : 0;
+    const dim3 grid((unsigned) (conv_blocks + ab_blocks), (unsigned) rows);
+    cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_CONV_GROUPS(MT, EX, AB) gdn_conv_groups_kernel<MT, EX, AB><<<grid, S, 0, st>>>(gr, qkv, conv_w, h, channels, \
+        qk_heads, eps, commit, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, rows)
+    if (!x) STRATA_CONV_GROUPS(1, true, false);
+    else switch (rows) {
+        case 1: STRATA_CONV_GROUPS(1, true, true); break;
+        case 2: STRATA_CONV_GROUPS(2, true, true); break;
+        case 3: STRATA_CONV_GROUPS(3, true, true); break;
+        case 4: STRATA_CONV_GROUPS(4, true, true); break;
+        case 5: STRATA_CONV_GROUPS(5, true, true); break;
+        case 6: STRATA_CONV_GROUPS(6, true, true); break;
+        default: STRATA_CONV_GROUPS(kVerifyMaxT, false, true); break;
+    }
+#undef STRATA_CONV_GROUPS
+    check("gdn_conv_groups");
 }
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
