@@ -11431,6 +11431,7 @@ int main(int argc, char** argv) {
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            if (!ver.wait_commit(e)) return false;   // STRATA_FUSE_ACOMMIT: the slot's last batch commit first
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
@@ -11506,6 +11507,7 @@ int main(int argc, char** argv) {
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            if (!ver.wait_commit(e)) return false;   // STRATA_FUSE_ACOMMIT: the slot's last batch commit first
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             if (slot_copy_direct && at == nullptr) {
@@ -11827,6 +11829,11 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
             }
+            // STRATA_FUSE_ACOMMIT: drafts not launched before the commit run after it (one stream at a time)
+            if (!pr.on && !ver.wait_commit(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             const Clock::time_point w2 = Clock::now();
             auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
             bt_run += msd(w0, w1);
@@ -11970,13 +11977,14 @@ int main(int argc, char** argv) {
                                          "pre-commit %.3f + commit %.3f [launch call %.3f, sync %.3f] + BT lines %.3f + "
                                          "copy+draft %.3f [prep %.3f, launch calls %.3f, wait %.3f] + fflush %.3f + adapt "
                                          "%.3f + report %.3f; run prep: pre_launch %.3f, checks+refresh_ar %.3f, graphs %.3f, "
-                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld (early %lld, ended %lld), checked %lld, %lld differ\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
+                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld (early %lld, ended %lld), checked %lld, %lld differ; acommit hits %lld\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
                                  M(tp.kPlan), M(tp.kRunTotal), M(tp.kRunPrep), M(tp.kRunLaunch), M(tp.kPreCommit),
                                  M(tp.kCommitTotal), M(tp.kCommitLaunch), M(tp.kCommitSync), M(tp.kEmitPrint),
                                  M(tp.kDraftTotal), M(tp.kDraftPrep), M(tp.kDraftLaunch), M(tp.kDraftWait), M(tp.kFlush),
                                  M(tp.kAdapt), M(tp.kReport), M(tp.kRunPreLaunch), M(tp.kSbRefresh), M(tp.kSbCapture),
                                  M(tp.kSbRecords), M(tp.kSbPle), tp.ple_checked, tp.ple_bad,
-                                 tp.pair_rounds, tp.early_rounds, tp.early_bad, tp.draft_checked, tp.draft_bad);
+                                 tp.pair_rounds, tp.early_rounds, tp.early_bad, tp.draft_checked, tp.draft_bad,
+                                 strata::core::acommit_dbg().hits.load());
                     tp = strata::core::TailProf{};
                     tp_long = 0;
                 }
@@ -12227,6 +12235,13 @@ int main(int argc, char** argv) {
                 }
             } else if (!next_line(line)) {
                 break;
+            }
+            {   // STRATA_FUSE_ACOMMIT: every command after the last batch commit has run (Verifier::wait_commit)
+                std::string werr;
+                if (!ver.wait_commit(werr)) {
+                    std::printf("ERR %s\n", werr.c_str());
+                    return 1;
+                }
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
