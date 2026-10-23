@@ -63,6 +63,8 @@ const Case CASES[] = {
     {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},     // Q6KBlock: half d after ql, qh, scales
     {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},     // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
     {"Q5_K wide", 13, 4096, 2048, 256, 176, {0, 2}},
+    {"Q4_0 head", 2, 2048, 131072, 32, 18, {0, -1}},   // --mtp-q4 head: the draft head's shape (two slots' rows)
+    {"Q4_0 head4k", 2, 4096, 65536, 32, 18, {0, -1}},
 };
 
 // a normal fp16 in +-[2^-10, 2^-5): exponent field 5..9 (bias 15), any mantissa, either sign
