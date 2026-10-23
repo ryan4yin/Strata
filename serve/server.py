@@ -8505,6 +8505,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
     from serve import replicas as rp
     n = len(groups)
+    # true/false keep the automatic split; an explicit list is one CPU list per replica (validated by cpu_sets).
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: one queue, a free replica takes the request whose prompt it holds",

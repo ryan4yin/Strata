@@ -53,6 +53,27 @@ class Config(unittest.TestCase):
     def test_cpu_sets_off(self):
         self.assertIsNone(cpu_sets(2, enabled=False))
         self.assertIsNone(cpu_sets(1))
+        self.assertIsNone(cpu_sets(2, enabled=None))
+
+    def test_cpu_sets_automatic_is_unchanged(self):
+        with mock.patch("serve.replicas.os.sched_getaffinity", return_value={0, 1, 2, 3}), \
+             mock.patch("serve.cpu_affinity.partition_cpu_sets", return_value=[[0, 1], [2, 3]]) as partition:
+            self.assertEqual(cpu_sets(2, True), [[0, 1], [2, 3]])
+            partition.assert_called_once_with(2, {0, 1, 2, 3})
+
+    def test_cpu_sets_explicit(self):
+        with mock.patch("serve.replicas.os.sched_getaffinity", return_value={0, 1, 2, 3}):
+            self.assertEqual(cpu_sets(2, [[0, 1], [2, 3]]), [[0, 1], [2, 3]])
+            with self.assertRaisesRegex(ReplicaConfigError, r"2 replicas.*1 list"):
+                cpu_sets(2, [[0, 1]])
+            with self.assertRaisesRegex(ReplicaConfigError, r"CPU 1 is in both replica 0 and replica 1"):
+                cpu_sets(2, [[0, 1], [1, 2]])
+            with self.assertRaisesRegex(ReplicaConfigError, r"allowed CPUs: \[0, 1, 2, 3\]"):
+                cpu_sets(2, [[0, 1], [2, 9]])
+            with self.assertRaisesRegex(ReplicaConfigError, "empty"):
+                cpu_sets(2, [[0, 1], []])
+            with self.assertRaisesRegex(ReplicaConfigError, "CPU number"):
+                cpu_sets(2, [[0, 1], [2, "3"]])
 
 
 class Routing(unittest.TestCase):
