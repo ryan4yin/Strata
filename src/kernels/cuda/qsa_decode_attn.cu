@@ -792,16 +792,14 @@ __device__ __forceinline__ void merge_sum_block(const float* __restrict__ pm, co
     }
 }
 
+// query blockIdx.y, head blockIdx.x, dimension threadIdx.x: its merged attention
 template <int U>
-__global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restrict__ part_acc,
-                                                           const float* __restrict__ part_m,
-                                                           const float* __restrict__ part_l, int n_chunks,
-                                                           const int32_t* __restrict__ steps,
-                                                           float* __restrict__ attn, long long scratch_stride = 0) {
+__device__ __forceinline__ float merge_v2_value(const float* __restrict__ part_acc, const float* __restrict__ part_m,
+                                                const float* __restrict__ part_l, int n_chunks,
+                                                const int32_t* __restrict__ steps, long long scratch_stride) {
     part_acc += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_m += (size_t) blockIdx.y * (size_t) scratch_stride;
     part_l += (size_t) blockIdx.y * (size_t) scratch_stride;
-    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
     // the step record the chunk kernel read for this query (attn_chunk_kernel: step + blockIdx.z * kStepCount)
     const int width = __ldg(steps + (size_t) blockIdx.y * kStepCount + kStepWidth);
     const int n_act = width > 0 ? min(n_chunks, (width - 1) / CHUNK + 1) : 0;
@@ -820,7 +818,36 @@ __global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restri
     float L = 0.0f, acc = 0.0f;
     for (int c0 = 0; c0 < n_full; c0 += U) merge_sum_block<U, false>(pm, pl, pa, c0, n_act, M, L, acc);
     if (n_full < n_act) merge_sum_block<U, true>(pm, pl, pa, n_full, n_act, M, L, acc);
-    attn[(size_t) h * HD + d] = L > 0.0f ? acc / L : 0.0f;
+    return L > 0.0f ? acc / L : 0.0f;
+}
+
+template <int U>
+__global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restrict__ part_acc,
+                                                           const float* __restrict__ part_m,
+                                                           const float* __restrict__ part_l, int n_chunks,
+                                                           const int32_t* __restrict__ steps,
+                                                           float* __restrict__ attn, long long scratch_stride = 0) {
+    attn += (size_t) blockIdx.y * (size_t) gridDim.x * HD;
+    attn[(size_t) blockIdx.x * HD + threadIdx.x] = merge_v2_value<U>(part_acc, part_m, part_l, n_chunks, steps,
+                                                                     scratch_stride);
+}
+
+// fuse-gdn (STRATA_FUSE_GATEMERGE): attn_merge_v2_kernel, then native_qsa_gate_apply's gate on the value it wrote -
+// q_full the query's q|gate rows (the gate half at + HD), gated[i] = attn[i] * (1 / (1 + expf(-raw))) as that kernel
+template <int U>
+__global__ void __launch_bounds__(HD) attn_merge_v2_gate_kernel(const float* __restrict__ part_acc,
+                                                                const float* __restrict__ part_m,
+                                                                const float* __restrict__ part_l, int n_chunks,
+                                                                const int32_t* __restrict__ steps,
+                                                                float* __restrict__ attn, long long scratch_stride,
+                                                                const float* __restrict__ q_full,
+                                                                float* __restrict__ gated) {
+    const size_t i = ((size_t) blockIdx.y * gridDim.x + blockIdx.x) * HD + threadIdx.x;
+    const float a = merge_v2_value<U>(part_acc, part_m, part_l, n_chunks, steps, scratch_stride);
+    attn[i] = a;
+    const float raw = q_full[((size_t) blockIdx.y * gridDim.x + blockIdx.x) * 2 * HD + HD + threadIdx.x];
+    const float sigmoid = 1.0f / (1.0f + expf(-raw));
+    gated[i] = a * sigmoid;
 }
 
 #if defined(STRATA_HIP_GFX906)
@@ -1119,6 +1146,36 @@ void qsa_decode_attn_batch_chunks(const float* q, const QsaAttnPools& pools, con
         std::fprintf(stderr, "qsa_decode_attn_batch_chunks: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+bool qsa_decode_attn_batch_merge_gate(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                      float* attn, const float* q_full, float* gated, int64_t n_q, void* stream) {
+    if (n_q <= 0) return true;
+#if defined(__HIPCC__)
+    // HIP only: on CUDA native_qsa.cu (the gate) is built with --use_fast_math and this file is not
+    if (!attn_merge_v2()) return false;
+    if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !steps || !attn ||
+        !q_full || !gated || n_q > 65535) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_merge_gate: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const float* part_acc = scratch;
+    const float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    const float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    attn_merge_v2_gate_kernel<kMergeU><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, (cudaStream_t) stream>>>(
+        part_acc, part_m, part_l, n_chunks, steps, attn, stride, q_full, gated);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_batch_merge_gate: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) steps; (void) cap; (void) s; (void) scratch; (void) attn; (void) q_full; (void) gated; (void) stream;
+    return false;
+#endif
 }
 
 void qsa_decode_attn_batch_merge(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,

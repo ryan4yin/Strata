@@ -23,6 +23,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -147,7 +148,10 @@ void scores_case(int rows) {
 void attn_case(int rows, bool int8) {
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
-    const int64_t ctx_max = 5000, pages = (ctx_max + PS - 1) / PS, prow = pages * NKV * PS;
+    // the pools hold every row's cells (row r has 900 + 641 r + (r % 2) 3 of them: 5390 at r = 7 - with 5000 the
+    // 8-row case read page_table past its end, and faulted once that memory held something else)
+    const int64_t ctx_max = 900 + 641 * (rows - 1) + 3 > 5000 ? 900 + 641 * (rows - 1) + 3 : 5000;
+    const int64_t pages = (ctx_max + PS - 1) / PS, prow = pages * NKV * PS;
     const int64_t cap = k::qsa_selection_width(ctx_max, s);
     std::mt19937 rng(23 + rows + int8);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -238,6 +242,31 @@ void attn_case(int rows, bool int8) {
             report(nm, std::memcmp(w.data(), b.data(), n * 4) == 0);
         } else
             std::printf("  attn wave chunks: declined (this card does not run attn_chunk_kernel_pre75)\n");
+        // STRATA_FUSE_GATEMERGE: the late merge with the output gate == the merge, then native_qsa_gate_apply
+        {
+            std::vector<float> qf((size_t) rows * NH * 2 * HD);
+            for (auto& x : qf) x = nd(rng) * 3.0f;
+            const float* d_qf = up(qf);
+            float *g_ref = nullptr, *g_fused = nullptr;
+            ck(cudaMalloc(&g_ref, n * 4), "malloc");
+            ck(cudaMalloc(&g_fused, n * 4), "malloc");
+            ck(cudaMemset(d_late, 0, n * 4), "memset");
+            cudaStream_t gs = nullptr;
+            ck(cudaStreamCreate(&gs), "stream");
+            k::native_qsa_gate_apply(d_ref, d_qf, g_ref, (int) (rows * NH), (int) HD, gs);
+            const bool fused = k::qsa_decode_attn_batch_merge_gate(d_steps, cap, s, scratch2, d_late, d_qf, g_fused, rows, gs);
+            ck(cudaStreamSynchronize(gs), "sync");
+            ck(cudaStreamDestroy(gs), "stream");
+            if (fused) {
+                ck(cudaDeviceSynchronize(), "sync");
+                const std::vector<float> la = down(d_late, n), ga = down(g_fused, n), gb = down(g_ref, n);
+                std::snprintf(nm, sizeof nm, "attn one merge + gate, %d rows, %s (attn and gated)", rows, int8 ? "int8" : "fp16");
+                report(nm, std::memcmp(la.data(), b.data(), n * 4) == 0 && std::memcmp(ga.data(), gb.data(), n * 4) == 0);
+            } else
+                std::printf("  attn merge + gate: declined (CUDA, or the v1 merge)\n");
+            cudaFree(g_ref);
+            cudaFree(g_fused);
+        }
         cudaFree(scratch2);
         cudaFree(d_late);
     }
@@ -696,6 +725,7 @@ void nr3_case(int n) {
 }  // namespace
 
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a device fault aborts: keep what was reported
     std::printf("batch rows parity (#2234 kernels against the per-row launches)\n");
     for (int r : {1, 2, 4, 8}) scores_case(r);
     for (int r : {1, 3, 8}) {
