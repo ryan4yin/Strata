@@ -12831,19 +12831,37 @@ int main(int argc, char** argv) {
                 pr.D[0] = O;
                 pr.D[1] = P;
                 const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                for (int r = 0; r < 2; ++r) {
-                    const int b = active[pr.tt[r]];
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), ver.final_R_all() + (size_t) first[pr.tt[r]] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice, pr.s0) != cudaSuccess ||
-                        !pr.D[r]->draft_pair_launch(*O, r, 2, outb + first[pr.tt[r]], pos[first[pr.tt[r]]], keep[b] - 1,
+                // gdn3 STRATA_FUSE_DRAFTPAIR_ROUND=1: both slots' rounds and the head in one graph, one launch.
+                static const bool draft_pair_round = [] {
+                    const char* v = std::getenv("STRATA_FUSE_DRAFTPAIR_ROUND");
+                    return v != nullptr && v[0] == '1';
+                }();
+                if (draft_pair_round && O->pair_round_capable() && P->pair_round_capable()) {
+                    const int b0 = active[t0], b1 = active[t1];
+                    if (!O->draft_pair_round_launch(*P, 2, 2,
+                                                    outb + first[t0], pos[first[t0]], keep[b0] - 1,
+                                                    outb + first[t1], pos[first[t1]], keep[b1] - 1,
+                                                    ver.final_R_all() + (size_t) first[t0] * stride,
+                                                    ver.final_R_all() + (size_t) first[t1] * stride,
                                                     pr.s0, err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                        std::printf("ERR batch MTP slots %d+%d: %s\n", b0, b1, err.c_str());
                         return -1;
                     }
-                }
-                if (!O->pair_head_launch(*P, pr.s0, err)) {
-                    std::printf("ERR batch MTP slots %d+%d: %s\n", active[t0], active[t1], err.c_str());
-                    return -1;
+                } else {
+                    for (int r = 0; r < 2; ++r) {
+                        const int b = active[pr.tt[r]];
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), ver.final_R_all() + (size_t) first[pr.tt[r]] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice, pr.s0) != cudaSuccess ||
+                            !pr.D[r]->draft_pair_launch(*O, r, 2, outb + first[pr.tt[r]], pos[first[pr.tt[r]]], keep[b] - 1,
+                                                        pr.s0, err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return -1;
+                        }
+                    }
+                    if (!O->pair_head_launch(*P, pr.s0, err)) {
+                        std::printf("ERR batch MTP slots %d+%d: %s\n", active[t0], active[t1], err.c_str());
+                        return -1;
+                    }
                 }
                 pr.on = true;
                 ++tp.pair_rounds;

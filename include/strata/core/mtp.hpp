@@ -73,6 +73,8 @@ public:
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
+    /// STRATA_FUSE_DRAFTPAIR_ROUND needs the four-row pair front's lane capacity in this drafter's buffers.
+    bool pair_round_capable() const { return max_t_ >= 4; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -142,6 +144,16 @@ public:
     bool draft_pair_launch(MtpDrafter& owner, int r, int T, const int32_t* tokens, int64_t p, int a, cudaStream_t s,
                            std::string& err);
     bool pair_head_launch(MtpDrafter& peer, cudaStream_t s, std::string& err);
+    /// STRATA_FUSE_DRAFTPAIR_ROUND=1 (--batch-mtp): both slots' one-draft rounds as ONE graph and one launch.
+    /// The two catch-up fronts are batched where the shared weights make that bitwise (fc_embedding, fc_hidden,
+    /// k/v, q, o); each slot keeps its own K/V state, positions, attention and PLE.  `final_R_own/peer` point at the
+    /// slot's two verifier residual rows; both are copied into the owner's four-row front buffer on `s` before the
+    /// graph.  The owner's pair graph also runs the head over both rows and the two selects.
+    bool draft_pair_round_launch(MtpDrafter& peer, int T_own, int T_peer,
+                                 const int32_t* tokens_own, int64_t p_own, int a_own,
+                                 const int32_t* tokens_peer, int64_t p_peer, int a_peer,
+                                 const float* final_R_own, const float* final_R_peer,
+                                 cudaStream_t s, std::string& err);
     void draft_pair_finish(int32_t* drafts, int* n_drafts = nullptr);
     /// STRATA_DBG_DRAFTCHECK: the head's logits of row r (r = 0: this drafter's own round's row)
     const float* head_logits_row(int r) const { return head_logits_ + (size_t) r * (size_t) head_vocab(); }
@@ -229,7 +241,17 @@ private:
     cudaGraphExec_t pair_exec_ = nullptr;      // the owner's: the head over both rows, both slots' selects
     const MtpDrafter* pair_peer_ = nullptr;
     std::chrono::steady_clock::time_point pair_t0_{};
+    // STRATA_FUSE_DRAFTPAIR_ROUND: one graph for both slots' rounds and the pair head, keyed by (T_own, T_peer).
+    cudaGraphExec_t pair_round_exec_[9][9] = {};
+    const MtpDrafter* pair_round_peer_[9][9] = {};
+    const float* pair_round_src0_[9][9] = {};
+    const float* pair_round_src1_[9][9] = {};
     bool capture_round_pre(int T, MtpDrafter& owner, int r, std::string& err);
+    bool capture_pair_round(MtpDrafter& peer, int T_own, int T_peer, const float* src_own, const float* src_peer,
+                            std::string& err);
+    bool pair_round_front(int T_own, int T_peer, MtpDrafter& peer, const float* src_own, const float* src_peer,
+                          cudaStream_t cs, std::string& err);
+    bool pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaStream_t cs, std::string& err);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
@@ -350,6 +372,15 @@ private:
     void* hit_scratch_ = nullptr;
     float* sh_scratch_ = nullptr;
     uint16_t* x_bf16_ = nullptr;
+    // STRATA_FUSE_DRAFTPAIR_ROUND: the pair's selected step/position rows, contiguous for the batched QSA calls
+    int32_t* pair_step_ = nullptr;
+    int32_t* pair_pos_ = nullptr;
+    int32_t* pair_tok_ = nullptr;
+    int32_t* pair_kpos_ = nullptr;
+    // STRATA_FUSE_DRAFTPAIR_EXPERT: the two slots' shared-expert gate/up rows and scalar gates
+    float* sh_gate2_ = nullptr;
+    float* sh_up2_ = nullptr;
+    float* sh_g2_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
