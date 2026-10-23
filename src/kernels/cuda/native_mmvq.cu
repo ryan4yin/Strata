@@ -1605,6 +1605,154 @@ __global__ void b6_mmvq_rows_pair_kernel(const typename F::Block* __restrict__ w
 }
 
 
+#if defined(__HIPCC__)
+// STRATA_Q6K_V2=1 (AMD): native_mmvq_multi_kernel<Q6KTraits, NC, WARPS, ROWS> (exact) and b6_mmvq_rows_kernel<Q6KTraits,
+// NC, ROWS> - a thread's blocks kbx = tid / 32 + 4 it, its sums in the same order, the same cross-warp reduction - with
+// every load of the thread issued before any use: the NI iterations' weight words of all ROWS rows, then their
+// activation words (once for all rows), nothing converted in between (loadcnt retires in order: the first iteration's
+// use waits for its own words only).  V1 issues one iteration's loads and waits on each in turn.  dp4a x scale as a
+// 24-bit product: |dp| <= 4 x 32 x 128 = 16384, |sc| <= 128, < 2^23: exact.  The floats as explicit fmas, as V1
+// contracts them (every instance, checked in its ISA): s = fma(d8_0, f0, 0), s = fma(d8_1, f1, s), tmp = fma(d, s, tmp).
+// The last iteration's loads past the row (threads with kbx >= blocks_per_row) and rows past n_out are clamped and
+// left out of the sums, as V1 leaves them out of its loops.
+template<int NCOLS, int ROWS, int NI, int CH = NI>
+__launch_bounds__(WARPS * WARP)
+__global__ void q6k_v2_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                              int n_in, int n_out) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / Q6KTraits::DIV;
+    const int x_stride = n_in / Q8K;
+    const int iqs = tid % 32, kb0 = tid / 32;
+    const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;   // Q6KTraits::load's
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift = 2 * ((iqs % 16) / 8);
+    float tmp[NCOLS][ROWS] = {};
+#pragma unroll
+    for (int c0 = 0; c0 < NI; c0 += CH) {   // CH iterations' loads at a time (CH < NI: fewer registers, one wait more)
+        int vl[CH][ROWS], vh[CH][ROWS], sc0[CH][ROWS], sc1[CH][ROWS];
+        half dw[CH][ROWS];
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            const int kc = min(kb0 + Q6KTraits::BPI * (c0 + c), blocks_per_row - 1);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                const Q6KBlock* b = w + std::size_t(min(row0 + i, n_out - 1)) * blocks_per_row + kc;
+                vl[c][i] = load_int_b2(b->ql, iqs);
+                vh[c][i] = load_int_b2(b->qh, 8 * (iqs / 16) + iqs % 8);
+                sc0[c][i] = b->scales[scale_offset];
+                sc1[c][i] = b->scales[scale_offset + 4];
+                dw[c][i] = b->d;
+            }
+        }
+        int u0[CH][NCOLS], u1[CH][NCOLS];
+        half2 ds0[CH][NCOLS], ds1[CH][NCOLS];
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            const int kby = min(kb0 + Q6KTraits::BPI * (c0 + c), blocks_per_row - 1) * Q6KTraits::KBY;
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const Q81Block* xb = x + std::size_t(j) * x_stride + kby + bq8_offset;
+                u0[c][j] = reinterpret_cast<const int*>(xb[0].qs)[iqs % 8];
+                u1[c][j] = reinterpret_cast<const int*>(xb[2].qs)[iqs % 8];
+                ds0[c][j] = xb[0].ds;
+                ds1[c][j] = xb[2].ds;
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int c = 0; c < CH; ++c) {
+            if (kb0 + Q6KTraits::BPI * (c0 + c) >= blocks_per_row) break;
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const int vhs = vh[c][i] >> vh_shift;
+                    int vi[2];
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int vil = (vl[c][i] >> (4 * h)) & 0x0f0f0f0f;
+                        const int vih = ((vhs >> (4 * h)) << 4) & 0x30303030;
+                        vi[h] = __vsubss4(vil | vih, 0x20202020);
+                    }
+                    const float d = __half2float(dw[c][i]);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) {
+                        const float f0 = (float) __mul24(STRATA_DP4A(vi[0], u0[c][j], 0), sc0[c][i]);
+                        const float f1 = (float) __mul24(STRATA_DP4A(vi[1], u1[c][j], 0), sc1[c][i]);
+                        float sumf = __builtin_fmaf(__low2float(ds0[c][j]), f0, 0.0f);
+                        sumf = __builtin_fmaf(__low2float(ds1[c][j]), f1, sumf);
+                        tmp[j][i] = __builtin_fmaf(d, sumf, tmp[j][i]);
+                    }
+                }
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    mmvq_sync_lds();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+#endif
+int g_q6k_v2 = -1;   // native_mmvq_set_q6k_v2; -1 = STRATA_Q6K_V2
+bool q6k_v2_on() {
+    static const int env = [] { const char* v = std::getenv("STRATA_Q6K_V2"); return v != nullptr && v[0] == '1' ? 1 : 0; }();
+    return (g_q6k_v2 >= 0 ? g_q6k_v2 : env) == 1;
+}
+#if defined(__HIPCC__)
+template<int NCOLS, int ROWS>
+bool q6k_v2_go(const Q6KBlock* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    const int ni = (n_in / Q6KTraits::DIV + Q6KTraits::BPI - 1) / Q6KTraits::BPI;
+    const dim3 grid(unsigned((n_out + ROWS - 1) / ROWS)), threads(WARP, WARPS);
+    switch (ni) {
+        case 1: q6k_v2_kernel<NCOLS, ROWS, 1><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out); return true;
+        case 2: q6k_v2_kernel<NCOLS, ROWS, 2><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out); return true;
+        case 3: q6k_v2_kernel<NCOLS, ROWS, 3><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out); return true;
+        case 4: q6k_v2_kernel<NCOLS, ROWS, 4><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out); return true;
+        case 5: q6k_v2_kernel<NCOLS, ROWS, 5><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out); return true;
+        case 6:   // 4 columns: 2 iterations' loads at a time (6144 -> 2560: 34.1 -> 32.0 us; at 2-3 columns all 6 are as fast)
+            q6k_v2_kernel<NCOLS, ROWS, 6, NCOLS >= 4 ? 2 : 6><<<grid, threads, 0, s>>>(w, x, y, n_in, n_out);
+            return true;
+        default: return false;
+    }
+}
+#endif
+// q6k_v2_kernel for a Q6_K call of NCOLS columns where B6 (2 or 4 rows a block) or the exact rows kernel would run:
+// true when it ran (one stderr line the first time it is on and does not take a call).  V2 takes 2 rows a block
+// whatever B6's table says (b6_mmvq_bench, R9700, 2-4 columns: R2 as fast or faster everywhere, qkv 2560 -> 10240 at
+// 4 columns 47.8 R4 -> 44.7 us R2; the outputs are the same bits either way)
+template<typename F, int NCOLS>
+bool q6k_v2_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+#if defined(__HIPCC__)
+    if constexpr (std::is_same_v<F, Q6KTraits> && NCOLS >= 2 && NCOLS <= 4) {
+        if (!q6k_v2_on()) return false;
+        if (q6k_v2_go<NCOLS, 2>(w, x, y, n_in, n_out, s)) return true;
+        static bool said = false;
+        if (!said)
+            std::fprintf(stderr, "strata: STRATA_Q6K_V2 not taken for a Q6_K call (%d columns, n_in %d): the default kernel "
+                                 "runs\n", NCOLS, n_in);
+        said = true;
+    }
+#else
+    (void) w; (void) x; (void) y; (void) n_in; (void) n_out; (void) s;
+#endif
+    return false;
+}
+
 // B7 (STRATA_DENSE_LDS=1, or b6 rows mode 16): the window's activations staged in LDS once per block, R rows per
 // warp over the whole row, NWB warps per block.  Each lane replays the per-thread work of the one-column kernel's four
 // warps one after another (thread 32 w + lane: blocks tid / T, + BPI, ...), keeping that thread's sum, and folds the
@@ -1743,6 +1891,7 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         }
         if (rows <= 0) return false;
         const dim3 threads(WARP, WARPS);
+        if ((rows == 2 || rows == 4) && q6k_v2_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return true;   // STRATA_Q6K_V2
         if (rows == 2)
             b6_mmvq_rows_kernel<F, NCOLS, 2><<<unsigned((n_out + 1) / 2), threads, 0, s>>>(w, x, y, n_in, n_out);
         else if (rows == 8)
@@ -2017,6 +2166,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         return;
     }
     constexpr int ROWS = 2;
+    if (!s26_tsum_on() && q6k_v2_launch<F, NCOLS>(w, x, y, n_in, n_out, s)) return;   // STRATA_Q6K_V2
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
     if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
     else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
@@ -2961,6 +3111,7 @@ void native_q6_k_unpack(const void* weights) {
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 void native_mmvq_set_b6_rows(int mode) { g_b6_rows_set = true; g_b6_rows = mode; }
+void native_mmvq_set_q6k_v2(int on) { g_q6k_v2 = on; }
 int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
