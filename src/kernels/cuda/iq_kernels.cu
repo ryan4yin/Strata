@@ -3059,6 +3059,131 @@ __global__ void __launch_bounds__(256) native_down_v2_kernel(const unsigned long
         }
     }
 }
+// Q2_0 down rows at n_ff 640 (STRATA_EXPDEC_V2): expdec_down_kernel<42, R>'s 16-lane rows and its sum tree
+// (row_dot_20_sub16: call t; call t + 16 for t < 4 into s16), with the block's rows' raw q2 words and d read through
+// global pointers before the staging's LDS wait.  Each sub-warp computes R consecutive rows a pass, P passes a block
+// (16 R P rows, the group's staged h made once), and the decorrelated rows' sums are interleaved so the u loads are
+// shared; the activations staged as expdec's (ed_stage_entry<ED_HB, true> / sw_stage_ed: the same words and the same
+// __low2float(ds)); S::apply_u's operations in its order.
+__device__ __forceinline__ Split<42>::W ed_q2_decode(uint32_t qa, uint32_t qb, uint32_t dh) {
+    Split<42>::W r;
+    const int16_t qs[4] = {(int16_t) (qa & 0xffffu), (int16_t) (qa >> 16), (int16_t) (qb & 0xffffu), (int16_t) (qb >> 16)};
+    r.d2 = __half2float(__ushort_as_half((unsigned short) dh));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int q = qs[j];
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        r.qx[j] = __byte_perm(qe, qo, 0x5140);
+        r.qy[j] = __byte_perm(qe, qo, 0x7362);
+    }
+    return r;
+}
+template<int R, int P, bool SW>
+__global__ void __launch_bounds__(256, 4) native_down_q2_v2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                                   const int32_t* __restrict__ grp_start,
+                                                                   const int32_t* __restrict__ n_groups,
+                                                                   const int32_t* __restrict__ ent_dst,
+                                                                   const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                                   float* __restrict__ out, const float* __restrict__ sw_gate = nullptr,
+                                                                   const float* __restrict__ sw_up = nullptr) {
+    using S = Split<42>;
+    static_assert(sizeof(block_q2_0) == 18 && ED_HB == 20, "Q2_0 down rows of 20 blocks");
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ alignas(16) int4 s_u[ED_NC * ED_HB * 2];
+    __shared__ float s_ds[ED_NC * ED_HB];
+    const int tid = threadIdx.x, sw = tid >> 4, t = tid & 15;
+    const int row_block = blockIdx.x * (16 * R * P);
+    const int k0 = t, k1 = t + 16, par = t & 1;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        // the block's rows' calls: k = t, and (lanes 0-3) k = t + 16; one Q2_0 block holds the two 32-value calls
+        uint32_t qa0[P * R], qb0[P * R], dh0[P * R], qa1[P * R], qb1[P * R], dh1[P * R];
+#pragma unroll
+        for (int q = 0; q < P; ++q)
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int row = row_block + q * (16 * R) + sw * R + r;
+                ed_g8* wr = (ed_g8*) ((const uint8_t*) grp_ptr[g] + L.down_off + (size_t) row * L.d_row);
+                ed_g8* b0 = wr + (k0 >> 1) * 18;
+                qa0[q * R + r] = ed_ld_b2(b0 + 2 + 8 * par);
+                qb0[q * R + r] = ed_ld_b2(b0 + 6 + 8 * par);
+                dh0[q * R + r] = ed_ld16(b0);
+                if (t < 4) {
+                    ed_g8* b1 = wr + (k1 >> 1) * 18;
+                    qa1[q * R + r] = ed_ld_b2(b1 + 2 + 8 * par);
+                    qb1[q * R + r] = ed_ld_b2(b1 + 6 + 8 * par);
+                    dh1[q * R + r] = ed_ld16(b1);
+                }
+            }
+        __builtin_amdgcn_sched_barrier(0);
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            if constexpr (SW) sw_stage_ed<ED_HB, true, ED_NC>(s_u, s_ds, sw_gate, sw_up, e, n, tid);
+            else
+                for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, true>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
+            iq_sync_lds();
+            auto run = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+#pragma unroll
+                for (int q = 0; q < P; ++q) {
+                    S::W w0[R], w1[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        w0[r] = ed_q2_decode(qa0[q * R + r], qb0[q * R + r], dh0[q * R + r]);
+                        if (t < 4) w1[r] = ed_q2_decode(qa1[q * R + r], qb1[q * R + r], dh1[q * R + r]);
+                    }
+                    float s[R][NC], s16[R][NC];
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) { s[r][c] = 0.0f; s16[r][c] = 0.0f; }
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        int u[8];
+                        ed_load_u<ED_HB>(s_u, c, k0, u);
+                        const float d0 = s_ds[c * ED_HB + k0];
+#pragma unroll
+                        for (int r = 0; r < R; ++r) s[r][c] += S::apply_u(w0[r], u, d0);
+                    }
+                    if (t < 4) {
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            int u[8];
+                            ed_load_u<ED_HB>(s_u, c, k1, u);
+                            const float d1 = s_ds[c * ED_HB + k1];
+#pragma unroll
+                            for (int r = 0; r < R; ++r) s16[r][c] += S::apply_u(w1[r], u, d1);
+                        }
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; ++r)
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            s[r][c] = __fadd_rn(s[r][c], s16[r][c]);
+#pragma unroll
+                            for (int o = 8; o > 0; o >>= 1) s[r][c] += __shfl_xor_sync(0xffffffffu, s[r][c], o);
+                        }
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c)
+#pragma unroll
+                            for (int r = 0; r < R; ++r)
+                                out[(size_t) ent_dst[e + c] * L.n_embd + row_block + q * (16 * R) + sw * R + r] = s[r][c];
+                }
+            };
+            switch (n) {
+                case 1: run(std::integral_constant<int, 1>{}); break;
+                case 2: run(std::integral_constant<int, 2>{}); break;
+                case 3: run(std::integral_constant<int, 3>{}); break;
+                default: run(std::integral_constant<int, 4>{}); break;
+            }
+        }
+    }
+}
+
 #endif
 
 // R IQ4_NL down rows, lane t of an 8-lane sub-warp: row_dot_40_sub8's tree.  s_p: the block's 8 words together
@@ -5743,6 +5868,26 @@ bool native_down_v2_on(const NativeExpertLayout& L, int d_rows) {
     return false;
 #endif
 }
+// STRATA_EXPDEC_V2's Q2_0 down (expdec_down_kernel<42> replacement): 16-row 16-lane layout; one stderr line if it is
+// on and not taken
+bool native_down_q2_v2_on(const NativeExpertLayout& L, int d_rows) {
+#if defined(__HIPCC__)
+    if (g_expdec_v2 && L.d_type == 42 && expdec_down_takes(L) &&
+        !(L.n_ff == 32 * ED_HB && L.n_embd % 16 == 0 && L.n_embd > 0 && d_rows == 16 && L.tail_off == 0)) {
+        static bool said = false;
+        if (!said)
+            std::fprintf(stderr, "strata expdec: STRATA_EXPDEC_V2 not taken for the Q2_0 down (n_ff %lld, n_embd %lld, %d rows a "
+                                 "block, tail %lld): expdec_down_kernel runs\n", (long long) L.n_ff, (long long) L.n_embd,
+                         d_rows, (long long) L.tail_off);
+        said = true;
+    }
+    return g_expdec_v2 && L.d_type == 42 && expdec_down_takes(L) && L.n_ff == 32 * ED_HB && L.n_embd % 16 == 0 &&
+           L.n_embd > 0 && d_rows == 16 && L.tail_off == 0;
+#else
+    (void) L; (void) d_rows;
+    return false;
+#endif
+}
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -5985,8 +6130,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #undef STRATA_D_AMD
 #endif
 #if defined(__HIPCC__)
-    // STRATA_EXPDEC_V2: native_down_v2_kernel for launch_down<20>'s kernel and the STRATA_FUSE_SWIGLU_DOWN one
-    if (native_down_v2_on(L, d_rows)) {
+    // STRATA_EXPDEC_V2: native_down_q2_v2_kernel for expdec_down_kernel<42>, native_down_v2_kernel for launch_down<20>'s
+    // kernel and the STRATA_FUSE_SWIGLU_DOWN one
+    if (native_down_q2_v2_on(L, d_rows)) {
+        constexpr int R = 2, P = 2;
+        const dim3 gd_q2((unsigned) ((L.n_embd + 16 * R * P - 1) / (16 * R * P)), (unsigned) gy);
+        if (sw_down) native_down_q2_v2_kernel<R, P, true><<<gd_q2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);
+        else native_down_q2_v2_kernel<R, P, false><<<gd_q2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else if (native_down_v2_on(L, d_rows)) {
         if (sw_down) native_down_v2_kernel<true><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);
         else native_down_v2_kernel<false><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
