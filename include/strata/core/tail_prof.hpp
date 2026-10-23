@@ -68,10 +68,14 @@ struct AcommitDbg {
     static constexpr int kN = 16;
     std::atomic<const void*> s[kN]{};
     std::atomic<long long> hits{0};
-    static bool on() {
-        static const bool v = [] { const char* e = std::getenv("STRATA_DBG_ACOMMIT"); return e != nullptr && e[0] == '1'; }();
+    // the keep words the batch commit read (an echo of its device copy) against the ones the host wrote for it;
+    // STRATA_DBG_ACOMMIT=2 also falsifies the host's record every 100th commit (the check's own test)
+    long long echo_checked = 0, echo_bad = 0;
+    static int level() {
+        static const int v = [] { const char* e = std::getenv("STRATA_DBG_ACOMMIT"); return e != nullptr ? std::atoi(e) : 0; }();
         return v;
     }
+    static bool on() { return level() >= 1; }
     void set(int i, const void* p) { if (i >= 0 && i < kN) s[i].store(p); }
     void clear() { for (auto& x : s) x.store(nullptr); }
     void check(const void* p, const char* site) {
