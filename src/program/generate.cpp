@@ -6573,6 +6573,31 @@ int main(int argc, char** argv) {
         else if (pin_wddm_cap)
             std::fprintf(stderr, "strata generate: multi-GPU under WDDM: at most 8 GiB of the expert arena is pinned "
                                  "(STRATA_ARENA_PIN_GIB changes it)\n");
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        {   // amdgpu KFD's GLOBAL system-memory pin ceiling: it is not per process and not per card, and a code object
+            // (loaded lazily on the first kernel) needs ~1 GiB of it.  Say what it is before anything pins.
+            const uint64_t kfd_limit = strata::core::kfd_system_pin_limit_bytes();
+            const int kfd_nodes = strata::core::kfd_gpu_node_count();
+            if (kfd_limit != 0) {
+                std::fprintf(stderr, "strata generate: KFD system pinned-memory limit ~%.1f GiB (RAM - RAM/64 - 1.5 GiB; "
+                                     "shared by every process and GPU; a code-object load needs ~1 GiB headroom; "
+                                     "STRATA_ARENA_PIN_GIB caps this arena)\n",
+                             (double) (kfd_limit >> 20) / 1024.0);
+                if (kfd_nodes > 1) {
+                    const uint64_t share = kfd_limit > (1ull << 30) ? (kfd_limit - (1ull << 30)) / (uint64_t) kfd_nodes : 0;
+                    if (pin_limit == 0 || pin_limit > share) {
+                        std::fprintf(stderr, "strata generate: WARNING: %d GPU nodes share that ceiling; one replica per node "
+                                             "must fit its arena pin plus its KV/other pinned memory in ~%.1f GiB (and leave "
+                                             "1 GiB for code objects). %s\n",
+                                     kfd_nodes, (double) (share >> 20) / 1024.0,
+                                     pin_limit == 0 ? "The arena pin is uncapped here: set STRATA_ARENA_PIN_GIB."
+                                                    : "Reduce STRATA_ARENA_PIN_GIB, or the first code-object load can fail with "
+                                                      "'invalid device function'.");
+                    }
+                }
+            }
+        }
+#endif
         // ---- STRATA_PIN_BY_NEED=1 (default off: the prefix pinning above, byte-identical).  WDDM does not let the
         // pin grow past ~RAM/2, and the prefix spends it on layers 0-31 whatever the GPU holds: layers 32-47 stay 100 %
         // CPU while ~10 GiB of pinned blobs sit in GPU-resident experts no DMA ever reads.  Pinning is registered
