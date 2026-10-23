@@ -5049,6 +5049,8 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     const int64_t CB = 2 + max_t_;
+    cudaEvent_t after = commit_after_;
+    commit_after_ = nullptr;
     // One prefix per slot: rejected draft rows must not enter recurrent state.
     for (int t = 0; t < S;) {
         const int first = t;
@@ -5069,6 +5071,10 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         strata::core::TailProf& tp = strata::core::tail_prof();
         const bool tpo = strata::core::TailProf::on() && next_ == nullptr;   // (one stage: the main card's)
         const auto tp0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
+        if (after != nullptr && cudaStreamWaitEvent(cs_, after, 0) != cudaSuccess) {
+            err = "verify: batch commit: waiting for the drafts";
+            return false;
+        }
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
         const auto tp1 = tpo ? tp.now() : tp0;

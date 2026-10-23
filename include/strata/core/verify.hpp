@@ -234,6 +234,8 @@ public:
     /// Commit an accepted prefix in each contiguous slot group of the last window. `keep` has
     /// one entry per slot (indexed by slot ID), each in 1..that slot's group length.
     bool commit_slot_prefixes(const int* keep, std::string& err);
+    /// STRATA_FUSE_DRAFTEARLY: the next commit_slot_prefixes' graph waits for `ev` on its stream (once)
+    void set_commit_after(cudaEvent_t ev) { commit_after_ = ev; }
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
 
@@ -503,6 +505,7 @@ private:
     // (ple_late_n_ tokens, 0 = none pending)
     std::vector<uint32_t> ple_late_rows_;
     int ple_late_n_ = 0;
+    cudaEvent_t commit_after_ = nullptr;
     bool gather_ple_late(std::string& err);
 public:
     /// STRATA_FUSE_PLEPF: prefetch the PLE rows of slot `slot`'s next batch window row, keyed as stage_batch keys it:
