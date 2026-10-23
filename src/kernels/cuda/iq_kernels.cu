@@ -5634,6 +5634,15 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
                                                               block_q8_1* __restrict__ hq) {
+#if defined(__HIPCC__)
+    // Do not remove: the SwiGLU product must be rounded before q8_1_store's block sum, exactly as in
+    // swiglu_q8_1_entries_kernel and native_gu_swiglu_kernel.  It is contractible into the reduction's first
+    // `sum += __shfl_xor(...)`; q8_1's ds packs (d, sum), and amax / the q bytes do not change, so the contraction
+    // shows up as one wrong ds word rather than a fan-out.  native_grouped_parity caught exactly that one word on
+    // IQ3_S / IQ4_NL at n_embd 512 / n_ff 256 (the 2560 shapes did not expose it in the compiler's schedule).
+    // GPU parity re-check after this pragma is pending.
+#pragma clang fp contract(off)
+#endif
     using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
@@ -5794,6 +5803,13 @@ void native_expert_set_mode(int mode, int phase) {
     (void) mode;
 #endif
     g_exp_phase = phase;
+}
+int native_expert_mode() {
+#if STRATA_EXP_LAYOUTS
+    return exp_mode();
+#else
+    return 0;
+#endif
 }
 
 namespace {
@@ -5971,8 +5987,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int em0 = (grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode();
 #endif
 #endif
+    // Layout and kernel-variant choices are separate: these are the variants this call would use, and each layout
+    // below applies the ones its kernels implement.  `layout0` is the CUDA / mode-0 path (the only one with the gfx12
+    // expdec V2 and SwiGLU-fused launches); the LDS layouts have their own fused gate/up kernel.
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool layout0 = em0 == 0;
+#else
+    const bool layout0 = true;
+#endif
+#if STRATA_EXP_LAYOUTS
+    const bool fused_gu = !v1 && em0 == 8 &&
+                          ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
@@ -5986,13 +6011,6 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
         check("native_expert_grouped/gu fused");
     }
-#endif
-    // The CUDA / mode-0 layout is the one the gfx12 fast paths (expdec V2, the fused SwiGLU launches) were built for;
-    // the AMD LDS layouts keep their own launches.  STRATA_EXP_LAYOUTS now builds everywhere, so this is a runtime choice.
-#if STRATA_EXP_LAYOUTS
-    const bool layout0 = em0 == 0;
-#else
-    const bool layout0 = true;
 #endif
     // 147-verify STRATA_GU_SWIGLU=1: gate/up + SwiGLU + q8_1 in one launch where the CUDA layout's 16-lane kernel would run
     bool gs_done = false;

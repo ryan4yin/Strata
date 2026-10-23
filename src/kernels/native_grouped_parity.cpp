@@ -286,12 +286,14 @@ void check_sw_gu(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt1
         return o;
     };
     k::native_expert_set_expdec(1);
-    {   // the fused path is the one run: with the counters off zero no block is a group's last, h stays unwritten
+    {   // the fused path is the one run: with the counters off zero no block is a group's last, h stays unwritten.
+        // The LDS layouts do not implement STRATA_FUSE_SWIGLU_GU; a small grid_groups forces the mode-0 layout there.
+        const int64_t probe_gy = k::native_expert_mode() == 0 ? 0 : 1;
         S.plan(3, 0, rng);
-        const auto ref = run(false, 0, 0x00);
+        const auto ref = run(false, probe_gy, 0x00);
         ck(cudaMemset(S.cnt, 0x01, 4096 * 4), "cnt");
         k::native_expert_set_fuse_sw_gu(1);
-        auto o = S.result(false, 0, 0x00, s);
+        auto o = S.result(false, probe_gy, 0x00, s);
         k::native_expert_set_fuse_sw_gu(-1);
         ck(cudaMemset(S.cnt, 0, 4096 * 4), "cnt");
         if (o == ref) { std::printf("  poisoned counters changed nothing: the fused path did not run  FAIL\n"); ++bad; }
@@ -346,15 +348,17 @@ void check_v2(int gu, int dt, int64_t H, int64_t FF, bool extreme, cudaStream_t 
         return o;
     };
     k::native_expert_set_expdec(1);
-    if (dt == 20) {   // V2's fused SwiGLU ran: with the counters off zero no block is a chunk's last, h stays unwritten
+    if (dt == 20) {   // V2's fused SwiGLU ran: with the counters off zero no block is a chunk's last, h stays unwritten.
+        // V2 only lives on the mode-0 layout; the LDS layouts take their own gate/up branch at grid_groups 0.
+        const int64_t probe_gy = k::native_expert_mode() == 0 ? 0 : 1;
         S.plan(3, 0, rng);
-        const auto ref = run(1, 1, 0, 0, 0x00);
+        const auto ref = run(1, 1, 0, probe_gy, 0x00);
         ck(cudaMemset(S.cnt, 0x01, 4096 * 4), "cnt");
         k::NativeExpertExpdecParams p = p0;
         p.v2 = 1;
         k::native_expert_set_expdec_params(p);
         k::native_expert_set_fuse_sw_gu(1);
-        const auto o = S.result(false, 0, 0x00, s);
+        const auto o = S.result(false, probe_gy, 0x00, s);
         k::native_expert_set_fuse_sw_gu(-1);
         ck(cudaMemset(S.cnt, 0, 4096 * 4), "cnt");
         if (o == ref) { std::printf("  poisoned counters changed nothing: V2's fused path did not run  FAIL\n"); ++bad; }
@@ -414,9 +418,19 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
             for (const int64_t gy : {(int64_t) 0, (int64_t) 1, (int64_t) 2, (int64_t) 3, (int64_t) 4, (int64_t) S.cap + 3}) {
                 const auto got = S.result(false, gy, (calls & 1) ? 0x7F : 0x00, s);
                 ++calls;
-                size_t diff = 0;
-                for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+                size_t diff = 0, first = ref.size();
+                for (size_t i = 0; i < ref.size(); ++i) {
+                    diff += ref[i] != got[i];
+                    if (ref[i] != got[i] && first == ref.size()) first = i;
+                }
                 if (diff) {
+                    if (bad < 2 && first < ref.size()) {
+                        float rf, gf;
+                        std::memcpy(&rf, &ref[first], 4);
+                        std::memcpy(&gf, &got[first], 4);
+                        std::printf("    first word %zu (row %zu col %zu%s): %08x %g vs %08x %g\n", first, first / (size_t) H,
+                                    first % (size_t) H, first >= S.out_floats ? ", hq" : "", ref[first], rf, got[first], gf);
+                    }
                     std::printf("  %-8s/%-7s base %d, %d groups, grid_groups %lld: %zu of %zu output/Q8 words differ  FAIL\n",
                                 name_of(gu), name_of(dt), base, ng, (long long) gy, diff, ref.size());
                     ++bad;
