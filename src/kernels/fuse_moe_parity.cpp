@@ -56,6 +56,72 @@ template <typename T> bool same(const std::vector<T>& a, const std::vector<T>& b
 
 // STRATA_FUSE_FETCH: wait_fetch_rebase vs wait_flag_ge(_or) + fetch_blobs + rebase_ptrs.  Blobs in device memory and in
 // mapped host memory (the PCIe share's source), 0..cap of them, the skip word equal to the ring or not.
+// STRATA_FUSE_PLAN: wait_copy_i32_from_mapped_unless vs wait_flag_ge_or + copy_i32_from_mapped_unless - the destination
+// words (copied, or untouched when the device planned the group), and the wait held until the host raises the flag
+int test_plan(std::mt19937& rng, cudaStream_t s) {
+    using namespace strata::kernels;
+    int bad = 0, cases = 0;
+    uint32_t* flag_d = nullptr;
+    uint32_t* flag = mapped<uint32_t>(4, &flag_d);
+    uint32_t* skip = dev<uint32_t>(4);
+    for (const int n : {0, 1, 37, 128, 129, 1000}) {
+        int32_t* src_d = nullptr;
+        int32_t* src = mapped<int32_t>((size_t) n + 1, &src_d);
+        for (int i = 0; i < n; ++i) src[i] = (int32_t) rng();
+        for (const int sk : {0, 1}) {
+            const uint32_t ring = 7 + (uint32_t) (rng() % 100);
+            *(volatile uint32_t*) flag = ring + (uint32_t) (rng() % 2);
+            const uint32_t skv = sk ? ring : ring - 1;
+            check(cudaMemcpy(skip, &skv, 4, cudaMemcpyHostToDevice), "skip");
+            std::vector<int32_t> junk((size_t) n + 1);
+            for (auto& v : junk) v = (int32_t) rng();
+            int32_t* a = dev<int32_t>((size_t) n + 1);
+            int32_t* b = dev<int32_t>((size_t) n + 1);
+            up(a, junk);
+            up(b, junk);
+            wait_flag_ge_or(flag_d, ring, skip, s);
+            copy_i32_from_mapped_unless(a, src_d, n, skip, ring, s);
+            wait_copy_i32_from_mapped_unless(flag_d, ring, skip, b, src_d, n, s);
+            check(cudaStreamSynchronize(s), "sync");
+            ++cases;
+            if (!same(down(a, (size_t) n + 1), down(b, (size_t) n + 1))) {
+                std::printf("    *** wait_copy_i32_unless n %d skip %d differs ***\n", n, sk);
+                ++bad;
+            }
+            cudaFree(a); cudaFree(b);
+        }
+        cudaFreeHost(src);
+    }
+    {   // the wait: held while the flag is below the ring and the skip word differs
+        const uint32_t ring = 1000, skv = 1;
+        *(volatile uint32_t*) flag = ring - 1;
+        check(cudaMemcpy(skip, &skv, 4, cudaMemcpyHostToDevice), "skip");
+        int32_t* src_d = nullptr;
+        int32_t* src = mapped<int32_t>(64, &src_d);
+        for (int i = 0; i < 64; ++i) src[i] = i * 3 + 1;
+        int32_t* b = dev<int32_t>(64);
+        check(cudaMemset(b, 0, 256), "memset");
+        wait_copy_i32_from_mapped_unless(flag_d, ring, skip, b, src_d, 64, s);
+        { struct timespec ts{0, 50000000}; nanosleep(&ts, nullptr); }
+        const bool held = cudaStreamQuery(s) == cudaErrorNotReady;
+        for (int i = 0; i < 64; ++i) src[i] = i * 5 + 2;   // written before the flag rises: these are what it copies
+        *(volatile uint32_t*) flag = ring;
+        check(cudaStreamSynchronize(s), "sync");
+        const auto got = down(b, 64);
+        bool ok = held;
+        for (int i = 0; i < 64; ++i) ok = ok && got[i] == i * 5 + 2;
+        ++cases;
+        if (!ok) { std::printf("    *** wait_copy_i32_unless: wait not held (%d) or wrong words ***\n", (int) held); ++bad; }
+        cudaFree(b);
+        cudaFreeHost(src);
+    }
+    cudaFreeHost(flag);
+    cudaFree(skip);
+    std::printf("  %-60s %s (%d cases)\n", "STRATA_FUSE_PLAN wait_copy_i32_unless == wait_or + copy_unless",
+                bad ? "*** NO ***" : "bitwise", cases);
+    return bad;
+}
+
 int test_fetch(std::mt19937& rng, cudaStream_t s) {
     using namespace strata::kernels;
     int bad = 0, cases = 0;
@@ -353,6 +419,7 @@ int main(int argc, char** argv) {
     int bad = 0;
     if (only.empty() || only == "fetch") bad += test_fetch(rng, s);
     if (only.empty() || only == "pair") bad += test_pair(rng, s);
+    if (only.empty() || only == "plan") bad += test_plan(rng, s);
     if (only.empty() || only == "combine") {
         for (const bool gated : {false, true}) {
             bad += test_combine(rng, s, gated);
