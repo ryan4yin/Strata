@@ -86,8 +86,12 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
+// COPY (fuse-gdn, STRATA_FUSE_KVRESOLVE): the same block then copies the missed blocks itself (copy_kernel's bytes),
+// so the copy needs no launch of its own and no block waits for another
+template <bool COPY = false>
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
-                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
+                                                     Runs r = {}) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -162,6 +166,19 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         c[1] += (unsigned long long) s_lookups;
         c[2] += 1ull;
     }
+    if constexpr (COPY) {
+        __syncthreads();   // the miss lists (phases 1-2) and the slots' table entries (phase 3) are written
+        int per = 0;       // 16-byte units of one block: every run of it, run after run
+        for (int a = 0; a < r.n; ++a) per += r.len[a] / 16;
+        for (long long i = threadIdx.x; i < (long long) placed * per; i += RT) {
+            const int k = (int) (i / per);
+            int u = (int) (i - (long long) k * per), a = 0;
+            while (u >= r.len[a] / 16) u -= r.len[a++] / 16;
+            const long long b = m.miss_block[k], sl = m.miss_slot[k];
+            reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a])[u] =
+                reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a])[u];
+        }
+    }
 }
 
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
@@ -214,6 +231,13 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
 void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream) {
+    static const bool fused = [] { const char* v = std::getenv("STRATA_FUSE_KVRESOLVE"); return v != nullptr && std::atoi(v) != 0; }();
+    kv_stream_resolve_with(m, slots, host, fmt, ids, steps, n_q, cap, s, stream, fused);
+}
+
+void kv_stream_resolve_with(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                            const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
+                            void* stream, bool fused_copy) {
     if (n_q <= 0) return;
     if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
         std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
@@ -226,6 +250,12 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
+    }
+    if (fused_copy) {
+        resolve_kernel<true><<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size,
+                                                                  runs_of(slots, host, fmt, s));
+        check("resolve + copy");
+        return;
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
