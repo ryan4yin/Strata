@@ -169,8 +169,10 @@ bool native_mmvq_pair_router_bell(int type1, int type2, const void* w1, const vo
                                   float* weights, int n_tok, const float* x, const int32_t* d_res, int n_expert, int64_t n,
                                   int64_t k, float* x_out, int32_t* ids_out, uint32_t* seq, void* stream);
 /// STRATA_FUSE_PROJ=1 (native_mmvq_proj_on(); HIP): native_mmvq(seg.type, seg.w -> seg.y, n_in, seg.n_out, ncols) for
-/// 2-4 matrices of one input in one launch, bitwise those calls.  So far Q6_K only, 1-4 columns (every segment's rows
-/// by q6k_v2_kernel's code).  false: nothing launched (the caller makes the calls).
+/// 2-4 matrices of one input in one launch, bitwise those calls.  Each segment may be Q4_K (12), Q5_K (13), Q6_K (14)
+/// or IQ4_XS (23), any mix, 1-4 columns: the block runs the kernel that matrix's own call would (the Q6K_V2 body for an
+/// all-Q6_K set, b6_mmvq_rows_kernel's body for the other formats and mixes).  false: nothing launched (the caller
+/// makes the calls).
 struct MmvqSeg {
     int type;
     const void* w;
