@@ -60,6 +60,13 @@ struct GdnGroups {
     int first[8] = {};
     int ntok[8] = {};
     int n = 0;
+    // fuse-gdn STRATA_FUSE_GDNDEFER (a window, not a commit): group i's slot may hold *pend_n[i] rows of the last window
+    // that its state does not have yet (gdn_pend_copy_layers' image of them: rows of h, gate, beta); the window runs
+    // them into the state first - the commit's arithmetic - and writes the state back.  pend_n[i] null: none
+    const float* pend_h[8] = {};
+    const float* pend_g[8] = {};
+    const float* pend_b[8] = {};
+    const int32_t* pend_n[8] = {};
 };
 /// gdn_step_norm_multi over several slots' groups at once (the generic kernel, grid.y = group; per group the
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
@@ -77,9 +84,21 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// gdn_step_norm_multi's commit (n_keep set, no outputs).  Every layer's arithmetic is the per-layer call's, so the result
 /// is bitwise the loop of per-layer calls.  Returns false (nothing launched) when the per-layer commit would not take the
 /// state-only kernel (STRATA_GDN_SPLIT=1, STRATA_GDN_COMMIT_SPLIT=0, STRATA_DBG_GDN=1): the caller then keeps the loop.
+/// fuse-gdn STRATA_FUSE_GDNDEFER: `n_state` non-null - the recurrence runs *n_state rows (0: none), the conv still *n_keep.
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
-                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream,
+                       const int32_t* n_state = nullptr);
+/// fuse-gdn STRATA_FUSE_GDNDEFER: the first *n_pend rows of every layer's h (conv_channels wide), gate and beta (h_v) -
+/// gdn_commit_layers' sources - copied into `pend`: layer j at pend + j * pend_stride, its h rows first (pm of them), then
+/// pm gate rows, then pm beta rows.  Nothing when *n_pend is 0.
+void gdn_pend_copy_layers(float* pend, int64_t pend_stride, int pm, const float* h, int64_t h_stride, const float* gate,
+                          const float* beta, int64_t gb_stride, int conv_channels, int h_v, int n_layers,
+                          const int32_t* n_pend, void* stream);
+/// ... and those rows run into every layer's state by gdn_commit_layers' recurrence kernel (the flush of a slot that
+/// leaves the windows with rows pending)
+void gdn_pend_apply_layers(float* state, int64_t state_stride, const float* pend, int64_t pend_stride, int pm,
+                           int conv_channels, int h_k, int h_v, int n_layers, const int32_t* n_pend, void* stream);
 /// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
 /// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be

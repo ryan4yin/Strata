@@ -768,6 +768,8 @@ Verifier::~Verifier() {
     if (arena_b_) cudaFree(arena_b_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (h_echo_) cudaFreeHost(h_echo_);
+    if (pend_) cudaFree(pend_);
+    if (b2_shadow_) cudaFree(b2_shadow_);
     if (ev_cbcopy_) cudaEventDestroy(ev_cbcopy_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
@@ -1695,6 +1697,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 bool gdn_q8 = false;   // STRATA_FUSE_GDNQ8: xq_ written by the recurrence below
                 if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
+                    const bool defer = defer_on() && tb == 0 && te == T;   // STRATA_FUSE_GDNDEFER: one group of rows
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
@@ -1702,13 +1705,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         gg.state[gg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
                         gg.first[gg.n] = first;
                         gg.ntok[gg.n] = t - first;
+                        if (defer) {
+                            const float* pl = pend_ + ((size_t) brow_[first] * pend_layers_ + (size_t) (gi - pend_gdn0_)) * pend_pl_;
+                            gg.pend_h[gg.n] = pl;
+                            gg.pend_g[gg.n] = pl + pend_pm_ * C;
+                            gg.pend_b[gg.n] = pl + pend_pm_ * C + pend_pm_ * HV;
+                            gg.pend_n[gg.n] = pendw_ + 2 * brow_[first] + 1;
+                        }
                         ++gg.n;
                     }
+                    (defer ? cap_defer_ : cap_defer_bad_) = true;
                     gdn_q8 = fuse_gdnq8_on() && tb == 0;   // xq_ row r = the window's row tb + r
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
                                                           y_, (int) HK, (int) HV, false, cs, gdn_q8 ? (void*) xq_ : nullptr);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
+                    cap_defer_bad_ = true;   // (STRATA_FUSE_GDNDEFER: no pending rows here)
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
@@ -3777,6 +3789,27 @@ static bool fuse_acommit_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ACOMMIT"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// STRATA_FUSE_GDNDEFER=1 (with ACOMMIT, one stage): the batch commit of a slot that goes on leaves its GDN recurrence
+// rows pending - it copies them (gdn_pend_copy_layers) and the next window runs them into the state before its own
+// (GdnGroups pend_*: the commit's arithmetic), one state read and write fewer per layer.  A slot whose rows are pending
+// and that the next window does not take, a window graph without the groups recurrence, and every wait_commit run
+// them first (flush_pend: the commit's own kernel)
+static bool fuse_gdndefer_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FUSE_GDNDEFER");
+        return fuse_acommit_on() && v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+static bool dbg_b2check_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DBG_B2CHECK"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+bool Verifier::defer_on() const { return fuse_gdndefer_on() && pend_ != nullptr && next_ == nullptr; }
+static uint64_t gdn_layer_floats(const ModelGeometry& g) {
+    return (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+           (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+}
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
@@ -3838,20 +3871,22 @@ bool Verifier::commit(int n_keep, std::string& err) {
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
-bool Verifier::wait_commit(std::string& err) {
+bool Verifier::wait_commit(std::string& err, bool flush) {
 #if defined(STRATA_GPU_METAL)
     (void) err;
+    (void) flush;
     return true;
 #endif
+    if (flush && !flush_pend(err)) return false;   // STRATA_FUSE_GDNDEFER: the pending rows into their states first
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
-        strata::core::acommit_dbg().clear();
+        if (std::find(pend_live_.begin(), pend_live_.end(), 1) == pend_live_.end()) strata::core::acommit_dbg().clear();
         echo_check();
     }
-    return next_ == nullptr || next_->wait_commit(err);
+    return next_ == nullptr || next_->wait_commit(err, flush);
 }
 
 
@@ -3875,23 +3910,44 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
     const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
     void* d = nullptr;
-    if (!mapped((size_t) (S * CB * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
+    if (!mapped((size_t) ((S * CB + 2 * S) * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
         err = "verify: the batch commit staging failed";
         return false;
     }
-    const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
+    std::memset(h_commitb_, 0, (size_t) (S * CB + 2 * S) * 4);
+    const uint64_t a = ((uint64_t) (S * CB + 2 * S) * 4 + 255) & ~255ull;
     if (cudaMalloc(&d, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4) != cudaSuccess) {
         err = "verify: the batch buffers do not fit";
         return false;
     }
     void* echo_d = nullptr;
     if ((cudaEventCreateWithFlags(&ev_cbcopy_, cudaEventDisableTiming) != cudaSuccess) ||
-        (strata::core::AcommitDbg::on() && !mapped((size_t) (S * CB * 4 + 16), (void**) &h_echo_, &echo_d))) {
+        (strata::core::AcommitDbg::on() && !mapped((size_t) ((S * CB + 2 * S) * 4 + 16), (void**) &h_echo_, &echo_d))) {
         err = "verify: the batch commit events failed";
         return false;
     }
     arena_b_ = d;
     commitb_ = (int32_t*) d;
+    pendw_ = commitb_ + S * CB;
+    h_pendw_ = h_commitb_ + S * CB;
+    m_pendw_ = m_commitb_ + S * CB;
+    cudaMemset(pendw_, 0, (size_t) S * 2 * 4);
+    pend_live_.assign((size_t) S, 0);
+    pend_want_.assign((size_t) S, 0);
+    if (fuse_gdndefer_on() && pend_ == nullptr && max_t_ <= strata::kernels::kVerifyMaxT) {
+        pend_layers_ = pend_gdn0_ = 0;
+        for (int64_t l = 0; l < le_; ++l)
+            if (!is_qsa_layer(*g_, l)) (l < lb_ ? pend_gdn0_ : pend_layers_) += 1;
+        pend_pm_ = max_t_;
+        pend_pl_ = pend_pm_ * (g_->ssm_conv_channels + 2 * g_->ssm_v_heads);
+        const size_t bytes = (size_t) S * pend_layers_ * pend_pl_ * 4;
+        if (pend_layers_ > 0 && cudaMalloc((void**) &pend_, bytes) != cudaSuccess) {
+            err = "verify: the GDN pending rows do not fit (STRATA_FUSE_GDNDEFER)";
+            return false;
+        }
+        std::fprintf(stderr, "strata verify: STRATA_FUSE_GDNDEFER: %.1f MB of pending GDN rows (%lld slots, %lld layers, %lld rows)\n",
+                     bytes / 1e6, (long long) S, (long long) pend_layers_, (long long) pend_pm_);
+    }
     tail_snap_b_ = (float*) ((uint8_t*) d + a);
     slots_ = slots;
     slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
@@ -3911,7 +3967,9 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     row_base_ = hbase;
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
+    cap_defer_ = cap_defer_bad_ = false;
     const bool ok = record_window(S, cs_, rerr);
+    b2_win_[bkey(rows, S, hbase)] = cap_defer_ && !cap_defer_bad_;
     batch_rec_ = false;
     row_base_ = 0;
     cudaGraph_t graph = nullptr;
@@ -3983,6 +4041,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const int first = t;
                     while (t < S && rows[t] == rows[first]) ++t;
                     SessionState& sx = *slots_[(size_t) rows[first]];
+                    const bool defer = defer_on() && n_gdn == pend_layers_ && gdn_index == pend_gdn0_;
                     all = gdn_commit_layers(sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats,
                                             (int64_t) gdn_floats,
                                             (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
@@ -3991,8 +4050,16 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                             gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
                                             beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV, MT * HV, (int) C,
                                             (int) g.ssm_k_heads, (int) HV, t - first, (int) n_gdn,
-                                            commitb_ + (size_t) rows[first] * CB, cs_);
+                                            commitb_ + (size_t) rows[first] * CB, cs_,
+                                            defer ? pendw_ + 2 * rows[first] : nullptr);
                     if (!all && first > 0) throw std::runtime_error("gdn_commit_layers declined after a launch");
+                    if (all && defer)   // STRATA_FUSE_GDNDEFER: the rows the window's recurrence runs (n_pend of them)
+                        gdn_pend_copy_layers(pend_ + (size_t) rows[first] * pend_layers_ * pend_pl_, pend_pl_, (int) pend_pm_,
+                                             h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                                             gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                                             beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV, MT * HV, (int) C,
+                                             (int) HV, (int) n_gdn, pendw_ + 2 * rows[first] + 1, cs_);
+                    b2_commit_[bkey(rows, S, hbase)] = all && defer;
                 }
                 gdn_fused = all;
             }
@@ -4271,6 +4338,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         int32_t* c = h_commitb_ + (size_t) rows[first] * CB;
         c[0] = t - first;
         c[1] = t - first - 1;
+        h_pendw_[2 * rows[first]] = t - first;   // (STRATA_FUSE_GDNDEFER: all rows, none pending)
+        h_pendw_[2 * rows[first] + 1] = 0;
         for (int64_t j = 0; j < max_t_; ++j)
             c[2 + j] = j < t - first ? (int32_t) pos[first + j] : -1;
     }
@@ -4338,6 +4407,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (tpo) tp.add(tp.kRunPreLaunch, tp0, tp.now());
     ple_late_n_ = 0;
     if (!stage_batch(rows, S, 0, tokens, pos, err, fuse_plelate_on())) return false;
+    if (defer_on()) {   // STRATA_FUSE_GDNDEFER: this window runs its slots' pending rows - unless it cannot
+        bool need = batch_self_commits(rows, S);   // (no commit after it would rewrite the words)
+        const auto it = b2_win_.find(bkey(rows, S, 0));
+        need = need || it == b2_win_.end() || !it->second;
+        for (size_t x = 0; x < pend_live_.size() && !need; ++x)
+            if (pend_live_[x]) need = std::find(rows, rows + S, (int) x) == rows + S;
+        if (need && !flush_pend(err)) return false;
+        for (int t = 0; t < S; ++t) pend_live_[(size_t) rows[t]] = 0;   // (the window runs them)
+    }
     const auto tp1 = tpo ? tp.now() : tp0;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (tpo) { tp.add(tp.kRunPrep, tp0, tp1); tp.add(tp.kRunLaunch, tp1, tp.now()); }
@@ -4446,28 +4524,109 @@ bool Verifier::commit_slots(std::string& err) {
     return commit_slot_prefixes(keep.data(), err);
 }
 
+// STRATA_FUSE_GDNDEFER: every slot's pending rows into its state, by gdn_commit_layers' own kernel, on cs_ behind the
+// commit that left them (wait_commit then waits for it)
+bool Verifier::flush_pend(std::string& err) {
+    if (std::find(pend_live_.begin(), pend_live_.end(), 1) == pend_live_.end()) return true;
+    const OnDevice on_device(device_);
+    cudaError_t q;   // the words in the staging go to the device first (the commit may still be queued)
+    while ((q = cudaEventQuery(ev_cbcopy_)) == cudaErrorNotReady) _mm_pause();
+    if (q != cudaSuccess) { err = std::string("verify: GDN pending rows: ") + cudaGetErrorString(q); return false; }
+    const ModelGeometry& g = *g_;
+    const uint64_t gdn_floats = gdn_layer_floats(g);
+    for (size_t x = 0; x < pend_live_.size(); ++x) {
+        if (!pend_live_[x]) continue;
+        SessionState& sx = *slots_[x];
+        strata::kernels::gdn_pend_apply_layers(sx.gdn_state + (size_t) (pend_gdn0_ - sx.gdn_ord0) * gdn_floats,
+                                               (int64_t) gdn_floats, pend_ + x * pend_layers_ * pend_pl_, pend_pl_,
+                                               (int) pend_pm_, (int) g.ssm_conv_channels, (int) g.ssm_k_heads,
+                                               (int) g.ssm_v_heads, (int) pend_layers_, pendw_ + 2 * x + 1, cs_);
+        cudaMemsetAsync(pendw_ + 2 * x + 1, 0, 4, cs_);
+        h_pendw_[2 * x + 1] = 0;
+        pend_live_[x] = 0;
+        ++strata::core::tail_prof().b2_flushes;
+    }
+    const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+    if (re != cudaSuccess) { err = std::string("verify: GDN pending rows: ") + cudaGetErrorString(re); return false; }
+    commit_pending_ = true;
+    return true;
+}
+
+// STRATA_DBG_B2CHECK: every 25th commit that leaves a slot's rows pending, a shadow of that slot's states with the rows
+// run the commit's way (gdn_pend_apply_layers on a copy, behind the commit); at the next commit - after the window that
+// ran them its way - the two compared bit for bit (the recurrence part of every layer)
+void Verifier::b2check_record() {
+    if (!dbg_b2check_on() || !defer_on()) return;
+    static long long n = 0;
+    int x = -1;
+    for (size_t i = 0; i < pend_live_.size() && x < 0; ++i) if (pend_live_[i]) x = (int) i;
+    if (x < 0 || ++n % 25 != 1) return;
+    const ModelGeometry& g = *g_;
+    const uint64_t gdn_floats = gdn_layer_floats(g);
+    const size_t bytes = (size_t) pend_layers_ * gdn_floats * 4;
+    if (b2_shadow_ == nullptr && cudaMalloc((void**) &b2_shadow_, bytes) != cudaSuccess) { b2_shadow_ = nullptr; return; }
+    SessionState& sx = *slots_[(size_t) x];
+    cudaMemcpyAsync(b2_shadow_, sx.gdn_state + (size_t) (pend_gdn0_ - sx.gdn_ord0) * gdn_floats, bytes,
+                    cudaMemcpyDeviceToDevice, cs_);
+    strata::kernels::gdn_pend_apply_layers(b2_shadow_, (int64_t) gdn_floats, pend_ + (size_t) x * pend_layers_ * pend_pl_,
+                                           pend_pl_, (int) pend_pm_, (int) g.ssm_conv_channels, (int) g.ssm_k_heads,
+                                           (int) g.ssm_v_heads, (int) pend_layers_, pendw_ + 2 * x + 1, cs_);
+    b2chk_slot_ = x;
+}
+
+void Verifier::b2check_compare() {
+    const int x = b2chk_slot_;
+    if (x < 0) return;
+    b2chk_slot_ = -1;
+    if (std::find(last_rows_, last_rows_ + last_t_, x) == last_rows_ + last_t_) return;   // (it left: flushed)
+    const ModelGeometry& g = *g_;
+    const uint64_t gdn_floats = gdn_layer_floats(g);
+    const size_t SF = (size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, n = (size_t) pend_layers_ * gdn_floats;
+    std::vector<uint32_t> a(n), b(n);
+    SessionState& sx = *slots_[(size_t) x];
+    if (cudaStreamSynchronize(cs_) != cudaSuccess ||
+        cudaMemcpy(a.data(), sx.gdn_state + (size_t) (pend_gdn0_ - sx.gdn_ord0) * gdn_floats, n * 4,
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(b.data(), b2_shadow_, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+        return;
+    strata::core::TailProf& tp = strata::core::tail_prof();
+    int bad = 0;
+    for (int64_t l = 0; l < pend_layers_; ++l)
+        bad += std::memcmp(a.data() + l * gdn_floats, b.data() + l * gdn_floats, SF * 4) != 0;
+    ++tp.b2_checked;
+    if (bad > 0 && ++tp.b2_bad <= 8)
+        std::fprintf(stderr, "strata: DBG_B2CHECK: slot %d: %d of %lld layers' states differ from the commit's\n", x, bad,
+                     (long long) pend_layers_);
+}
+
 void Verifier::stage_commit_words(const int* rows, int S) {
     if (!fuse_acommit_on()) return;
     const int64_t CB = 2 + max_t_;
     for (int t = 0; t < S; ++t)
         if (t == 0 || rows[t] != rows[t - 1])
             strata::kernels::copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
+    // STRATA_FUSE_GDNDEFER: every slot's (n_state, n_pend) - the host's words always mirror the device's (flush_pend
+    // zeroes both), so one copy of all of them
+    if (defer_on()) strata::kernels::copy_i32_from_mapped(pendw_, m_pendw_, (int64_t) slots_.size() * 2, cs_);
     (void) cudaEventRecord(ev_cbcopy_, cs_);
 }
 
 void Verifier::echo_record(const int* rows, int S) {
     if (!strata::core::AcommitDbg::on() || h_echo_ == nullptr) return;
     const int64_t CB = 2 + max_t_;
-    (void) cudaMemcpyAsync(h_echo_, commitb_, (size_t) slots_.size() * CB * 4, cudaMemcpyDeviceToHost, cs_);
+    const size_t NS = slots_.size();
+    (void) cudaMemcpyAsync(h_echo_, commitb_, (NS * CB + 2 * NS) * 4, cudaMemcpyDeviceToHost, cs_);
     echo_slots_.clear();
     echo_want_.clear();
     for (int t = 0; t < S; ++t)
         if (t == 0 || rows[t] != rows[t - 1]) {
             echo_slots_.push_back(rows[t]);
             echo_want_.insert(echo_want_.end(), h_commitb_ + (size_t) rows[t] * CB, h_commitb_ + (size_t) (rows[t] + 1) * CB);
+            echo_want_.insert(echo_want_.end(), h_pendw_ + 2 * rows[t], h_pendw_ + 2 * rows[t] + 2);
         }
     static long long n = 0;
     if (strata::core::AcommitDbg::level() == 2 && ++n % 100 == 0) echo_want_[0] += 1000;   // the check's own test
+    if (strata::core::AcommitDbg::level() == 3 && ++n % 100 == 0) echo_want_[CB + 1] += 1000;   // (its pending word)
     echo_live_ = true;
 }
 
@@ -4477,12 +4636,16 @@ void Verifier::echo_check() {
     echo_live_ = false;
     const int64_t CB = 2 + max_t_;
     strata::core::AcommitDbg& d = strata::core::acommit_dbg();
+    const size_t NS = slots_.size(), W = (size_t) CB + 2;
     for (size_t i = 0; i < echo_slots_.size(); ++i) {
         ++d.echo_checked;
-        if (std::memcmp(h_echo_ + (size_t) echo_slots_[i] * CB, echo_want_.data() + i * CB, (size_t) CB * 4) != 0 &&
+        const int32_t* dev_w = h_echo_ + NS * CB + 2 * (size_t) echo_slots_[i];
+        if ((std::memcmp(h_echo_ + (size_t) echo_slots_[i] * CB, echo_want_.data() + i * W, (size_t) CB * 4) != 0 ||
+             std::memcmp(dev_w, echo_want_.data() + i * W + CB, 8) != 0) &&
             ++d.echo_bad <= 8)
-            std::fprintf(stderr, "strata: DBG_ACOMMIT: slot %d's batch commit read keep %d, the host wrote %d\n",
-                         echo_slots_[i], h_echo_[(size_t) echo_slots_[i] * CB], echo_want_[i * CB]);
+            std::fprintf(stderr, "strata: DBG_ACOMMIT: slot %d's batch commit read keep %d (state %d, pending %d), the "
+                                 "host wrote %d (%d, %d)\n", echo_slots_[i], h_echo_[(size_t) echo_slots_[i] * CB], dev_w[0],
+                         dev_w[1], echo_want_[i * W], echo_want_[i * W + CB], echo_want_[i * W + CB + 1]);
     }
 }
 
@@ -4495,6 +4658,12 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     cudaEvent_t after = commit_after_;
     commit_after_ = nullptr;
     echo_check();   // (the last commit and its echo ran before this window)
+    b2check_compare();
+    // STRATA_FUSE_GDNDEFER: this commit's graph leaves the rows of a slot that goes on pending (when it can)
+    const bool b2c = defer_on() && !batch_self_commits(last_rows_, S) && [&] {
+        const auto it = b2_commit_.find(bkey(last_rows_, S, row_base_));
+        return it != b2_commit_.end() && it->second;
+    }();
     // One prefix per slot: rejected draft rows must not enter recurrent state.
     for (int t = 0; t < S;) {
         const int first = t;
@@ -4509,7 +4678,13 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         c[1] = n - 1;
         for (int j = 0; j < max_t_; ++j)
             c[2 + j] = j < n ? (int32_t) last_pos_b_[first + j] : -1;
+        const int b = last_rows_[first];
+        const bool p = b2c && pend_want_[(size_t) b];
+        h_pendw_[2 * b] = p ? 0 : n;
+        h_pendw_[2 * b + 1] = p ? n : 0;
+        pend_live_[(size_t) b] = p;
     }
+    std::fill(pend_want_.begin(), pend_want_.end(), 0);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
         strata::core::TailProf& tp = strata::core::tail_prof();
@@ -4523,6 +4698,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
         echo_record(last_rows_, S);
+        b2check_record();
         const auto tp1 = tpo ? tp.now() : tp0;
         if (fuse_acommit_on() && g_commit_async && next_ == nullptr) {
             // STRATA_FUSE_ACOMMIT=1: no wait, commit()'s set_commit_async contract - the next window follows it on cs_, the
