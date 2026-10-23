@@ -238,7 +238,7 @@ void check_sw_down(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
         for (const int base : {0, 7}) {
             for (const int groups : {0, 1, 2, 3, 5, 8, 24}) {
                 const int ng = S.plan(groups, base, rng);
-                for (const int64_t gy : {(int64_t) 0, (int64_t) 4}) {
+                for (const int64_t gy : {(int64_t) 0, (int64_t) 1, (int64_t) 4}) {
                     const auto ref = out_of(false, gy, 0x00);
                     for (size_t i = 0; i < ref.size(); ++i) written += ref[i] != 0xFFFFFFFFu;
                     const auto got = out_of(true, gy, (calls & 1) ? 0x7F : 0x00);
@@ -324,8 +324,9 @@ struct Layers {
 };
 
 // the 48 calls of one variant captured in one graph
-cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, int64_t gy) {
+cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, int64_t gy, int sw = -1) {
     k::native_grouped_set_v1(v1);
+    k::native_expert_set_fuse_sw_down(sw);
     cudaGraph_t g;
     cudaGraphExec_t ge;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
@@ -335,6 +336,7 @@ cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, 
     ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
     ck(cudaGraphDestroy(g), "graph");
     k::native_grouped_set_v1(false);
+    k::native_expert_set_fuse_sw_down(-1);
     return ge;
 }
 
@@ -390,6 +392,27 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         ck(cudaGraphExecDestroy(ga), "graph");
         ck(cudaGraphExecDestroy(gb), "graph");
         std::printf("  %-42s %8.2f / %8.2f us (grid_groups %lld)\n", r.what, median(ta), median(tb), (long long) r.gy);
+    }
+    // STRATA_FUSE_SWIGLU_DOWN off / on: the model's IQ4_NL / Q2_0 downs at 2560 x 640, expdec on (Q2_0's fused down)
+    std::printf("--bench STRATA_FUSE_SWIGLU_DOWN: off / on, us per call (same graphs and medians as above)\n");
+    for (const int dt : {20, 42}) {
+        Setup W(21, dt, 2560, 640, 4, 10, 32, rng, s);
+        for (const auto& r : rows) {
+            const int ng = W.plan_sizes(r.sizes, 0, rng);
+            const Layers Ls(W, ng);
+            cudaGraphExec_t ga = make_graph(s, W, Ls, false, r.gy, 0), gb = make_graph(s, W, Ls, false, r.gy, 1);
+            std::vector<float> ta, tb;
+            for (int i = 0; i < kWarmPairs + kPairs; ++i) {
+                const bool a_first = i % 2 == 0;
+                const float x = launch_us(s, a_first ? ga : gb, e0, e1), y = launch_us(s, a_first ? gb : ga, e0, e1);
+                if (i < kWarmPairs) continue;
+                ta.push_back(a_first ? x : y);
+                tb.push_back(a_first ? y : x);
+            }
+            ck(cudaGraphExecDestroy(ga), "graph");
+            ck(cudaGraphExecDestroy(gb), "graph");
+            std::printf("  IQ3_S/%-7s %-42s %8.2f / %8.2f us\n", name_of(dt), r.what, median(ta), median(tb));
+        }
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
