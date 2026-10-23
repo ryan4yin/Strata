@@ -2554,7 +2554,11 @@ __device__ __forceinline__ void ed_gu_rows(const uint8_t* const* wr, const int4*
 
 // gate/up: 16 sub-warps of 16 lanes, R rows each = 16 R rows per pass, `rb` rows per block (a multiple of 16 R; 2 n_ff
 // is one too, so a pass is whole or absent for the entire block).  Group stride as native_gu_multi_kernel.
-template<int TG, int R, int MINB>
+// STRATA_FUSE_SWIGLU_GU (SWE): after a group's rows the block counts itself done in its column chunk's counter (its
+// gate / up stores fenced first); the second of the chunk's gate block and up block then makes those columns' h q8_1
+// blocks (swiglu_q8_1_entries_kernel's values, sw_q8_1_value) into sw_hq and sets the counter back to 0 for the next
+// call.  No block waits for another.
+template<int TG, int R, int MINB, bool SWE = false>
 #if defined(__HIPCC__)
 __global__ void __launch_bounds__(256, MINB * 2) expdec_gu_kernel(
 #else
@@ -2565,7 +2569,9 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
                                                                             const int32_t* __restrict__ n_groups,
                                                                             const int32_t* __restrict__ ent_tok,
                                                                             const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                                            float* __restrict__ gate, float* __restrict__ up, int rb) {
+                                                                            float* __restrict__ gate, float* __restrict__ up, int rb,
+                                                                            block_q8_1* __restrict__ sw_hq = nullptr,
+                                                                            uint32_t* __restrict__ sw_cnt = nullptr) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
@@ -2609,6 +2615,30 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
                     case 3: run(std::integral_constant<int, 3>{}); break;
                     default: run(std::integral_constant<int, 4>{}); break;
                 }
+            }
+        }
+        if constexpr (SWE) {
+            // block x < nch holds gate columns [x rb, x rb + rb), block x + nch the same up columns (n_ff % rb == 0,
+            // rb % 32 == 0): the second of the two to finish makes those columns' q8_1 blocks of the group's entries
+            const int nch = n_ff / rb, ch = (int) blockIdx.x % nch;
+            __shared__ int s_last;
+            __threadfence();   // this block's gate / up rows, before it counts itself done
+            __syncthreads();
+            if (tid == 0) s_last = atomicAdd(sw_cnt + g * nch + ch, 1u) == 1u;
+            __syncthreads();
+            if (s_last) {   // block-uniform
+                __threadfence();   // the other block's rows, seen
+                const int warp = tid >> 5, lane = tid & 31, bpe = rb / 32;
+                for (int idx = warp; idx < (e1 - e0) * bpe; idx += 8) {
+                    const int c = idx / bpe, k = idx - c * bpe;
+                    const long long i = (long long) (e0 + c) * n_ff + (long long) ch * rb + k * 32 + lane;
+                    int8_t q;
+                    half2 ds;
+                    sw_q8_1_value(gate[i], up[i], q, ds);
+                    sw_hq[i / 32].qs[lane] = q;
+                    if (lane == 0) sw_hq[i / 32].ds = ds;
+                }
+                if (tid == 0) sw_cnt[g * nch + ch] = 0;
             }
         }
     }
@@ -4106,23 +4136,31 @@ int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
 template<int TG, int R, int MINB>
 void expdec_gu_r(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
-                 float* gate, float* up) {
+                 float* gate, float* up, block_q8_1* sw_hq, uint32_t* sw_cnt) {
     const int nrow = 2 * (int) L.n_ff;
     const int rb = expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
     const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
+    const bool swe = sw_hq != nullptr && rb % 32 == 0 && L.n_ff % rb == 0;   // STRATA_FUSE_SWIGLU_GU (column chunks)
+    if (swe)
+        expdec_gu_kernel<TG, R, MINB, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
+                                                                 sw_hq, sw_cnt);
+    else
     expdec_gu_kernel<TG, R, MINB><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb);
+    if (sw_hq != nullptr && !swe)   // the caller left the SwiGLU + q8_1 launch out: it runs here
+        swiglu_q8_1_entries_kernel<<<(unsigned) ((cap_groups * L.n_ff + 255) / 256), 256, 0, s>>>(   // grid-stride
+            gate, up, grp_start, n_groups, (int) L.n_ff, sw_hq);
 }
 template<int TG>
 void expdec_gu_t(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
-                 float* gate, float* up) {
+                 float* gate, float* up, block_q8_1* sw_hq, uint32_t* sw_cnt) {
     const bool b4 = g_expdec_minb >= 4;
     if (expdec_r() == 2) {
-        if (b4) expdec_gu_r<TG, 2, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-        else expdec_gu_r<TG, 2, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        if (b4) expdec_gu_r<TG, 2, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt);
+        else expdec_gu_r<TG, 2, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt);
     } else {
-        if (b4) expdec_gu_r<TG, 1, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-        else expdec_gu_r<TG, 1, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        if (b4) expdec_gu_r<TG, 1, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt);
+        else expdec_gu_r<TG, 1, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt);
     }
 }
 // One line on stderr per (role, format, taken or not), the first time STRATA_EXPDEC=1 meets it: the proof in the
@@ -4161,19 +4199,21 @@ void expdec_note(const NativeExpertLayout& L, bool gu, bool taken, cudaStream_t 
 // false: EXPDEC is off or does not take this layout (the caller launches the default kernels)
 bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, float* gate,
-               float* up) {
+               float* up, block_q8_1* sw_hq = nullptr, uint32_t* sw_cnt = nullptr) {
     if (!expdec_mode() || g_old_kernels) return false;
     if (!expdec_gu_ok(L)) { expdec_note(L, true, false, s, gy, cap_groups); return false; }
     expdec_note(L, true, true, s, gy, cap_groups);
     switch (L.gu_type) {
-        case 16: expdec_gu_t<16>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 17: expdec_gu_t<17>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 18: expdec_gu_t<18>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        case 21: expdec_gu_t<21>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
-        default: expdec_gu_t<22>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 16: expdec_gu_t<16>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt); break;
+        case 17: expdec_gu_t<17>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt); break;
+        case 18: expdec_gu_t<18>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt); break;
+        case 21: expdec_gu_t<21>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt); break;
+        default: expdec_gu_t<22>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, sw_hq, sw_cnt); break;
     }
     return true;
 }
+// expdec_gu above takes this layer's gate/up
+bool expdec_gu_takes(const NativeExpertLayout& L) { return expdec_mode() && !g_old_kernels && expdec_gu_ok(L); }
 template<int TD, int R>
 void expdec_down_r(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                    const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out,
@@ -5215,11 +5255,19 @@ bool fuse_sw_down_on() {
     return g_fuse_sw_down >= 0 ? g_fuse_sw_down != 0 : env;
 }
 void native_expert_set_fuse_sw_down(int on) { g_fuse_sw_down = on < 0 ? -1 : (on ? 1 : 0); }
+// STRATA_FUSE_SWIGLU_GU=1 (opt-in): the expdec gate/up kernel's last block of a group makes its h q8_1 blocks
+int g_fuse_sw_gu = -1;
+bool fuse_sw_gu_on() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_FUSE_SWIGLU_GU"); return v != nullptr && std::atoi(v) != 0; }();
+    return g_fuse_sw_gu >= 0 ? g_fuse_sw_gu != 0 : env;
+}
+void native_expert_set_fuse_sw_gu(int on) { g_fuse_sw_gu = on < 0 ? -1 : (on ? 1 : 0); }
+bool native_expert_fuse_sw_gu() { return fuse_sw_gu_on(); }
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, uint32_t* sw_counters) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -5346,6 +5394,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                          (expdec_down_takes(L) ||
                           (L.d_type == 20 && L.n_ff == 640 && !g_old_kernels && !split_off<20>() && !g_no_sub16_gu));
 #endif
+    // STRATA_FUSE_SWIGLU_GU: elsewhere (a VRAM call) the expdec gate/up kernel's last block of each group makes its h
+    // q8_1 blocks (sw_counters: cap_groups words, zero between calls), so the SwiGLU + q8_1 launch is left out
+#if STRATA_EXP_LAYOUTS || defined(STRATA_HIP_GFX906)
+    const bool sw_gu = false;
+#else
+    const bool sw_gu = !sw_down && sw_counters != nullptr && cap_groups * (L.n_ff / 32) <= 4096 && !gs_done && !v1 && L.had_block == 0 &&
+                       g_exp_phase == 0 && fuse_sw_gu_on() && expdec_gu_takes(L);
+#endif
 #if STRATA_EXP_LAYOUTS
     if (g_exp_phase != 2 && !fused_gu && !gs_done) {
 #else
@@ -5381,7 +5437,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_GU_AMD
 #endif
-    if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up))   // STRATA_EXPDEC=1
+    if (!expdec_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, sw_gu ? hq : nullptr,
+                   sw_gu ? sw_counters : nullptr))   // STRATA_EXPDEC=1
     switch (L.gu_type) {
 #define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         STRATA_GU_FMTS(STRATA_GU)
@@ -5402,7 +5459,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (sw_down) {
+    if (sw_down || sw_gu) {
     } else if (sw_v1 || L.had_block > 0) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
