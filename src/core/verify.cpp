@@ -3723,6 +3723,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             return false;
         }
         commit_pending_ = false;
+        strata::core::acommit_dbg().clear();
         if (prof_on_ && G == 1) collect_profile();
         return true;
     }
@@ -3750,6 +3751,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
     commit_pending_ = false;
+    strata::core::acommit_dbg().clear();
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
@@ -4095,6 +4097,7 @@ bool Verifier::wait_commit(std::string& err) {
         commit_pending_ = false;
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+        strata::core::acommit_dbg().clear();
     }
     return next_ == nullptr || next_->wait_commit(err);
 }
@@ -4816,6 +4819,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // --batch-mtp only (limit 0 = 0.1.39: no eviction): slot rotation creates new layouts; bound the captured graph
     // pairs, evicting the least recently used layout.  Without a limit the same eviction frees VRAM for a capture.
     const auto key = bkey(rows, S, hbase);
+    // STRATA_FUSE_ACOMMIT: a capture or an eviction (which destroys graph execs) after the last batch commit has run
+    if (exec_bm_.find(key) == exec_bm_.end() && !wait_commit(err)) return false;
     bool evicted = false;
     if (batch_graph_limit_ > 0 && exec_bm_.find(key) == exec_bm_.end() && exec_bm_.size() >= batch_graph_limit_ &&
         !evict_batch_graph(key, evicted, err))
@@ -5043,6 +5048,12 @@ bool Verifier::commit_slots(std::string& err) {
     return commit_slot_prefixes(keep.data(), err);
 }
 
+// STRATA_FUSE_ACOMMIT=1: commit_slot_prefixes launches the batch commit without waiting for it (one card)
+static bool fuse_acommit_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ACOMMIT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
@@ -5078,9 +5089,24 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
         const auto tp1 = tpo ? tp.now() : tp0;
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
-        if (tpo) { tp.add(tp.kCommitLaunch, tp0, tp1); tp.add(tp.kCommitSync, tp1, tp.now()); }
+        if (fuse_acommit_on() && g_commit_async && next_ == nullptr) {
+            // STRATA_FUSE_ACOMMIT=1: no wait, commit()'s set_commit_async contract - the next window follows it on cs_, the
+            // drafts ran before it (DRAFTEARLY) or wait for it (batch_step), and whoever touches a slot's session from
+            // another stream or the host calls wait_commit() first (the command loop, the slot copies, a capture)
+            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            if (re != cudaSuccess) { err = std::string("verify: batch commit event: ") + cudaGetErrorString(re); return false; }
+            (void) cudaStreamQuery(cs_);
+            commit_pending_ = true;
+            if (strata::core::AcommitDbg::on())
+                for (int t = 0, k = 0; t < S; ++t)
+                    if (t == 0 || last_rows_[t] != last_rows_[t - 1])
+                        strata::core::acommit_dbg().set(k++, (const void*) &*slots_[(size_t) last_rows_[t]]);
+            if (tpo) tp.add(tp.kCommitLaunch, tp0, tp1);
+        } else {
+            const cudaError_t se = cudaStreamSynchronize(cs_);
+            if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+            if (tpo) { tp.add(tp.kCommitLaunch, tp0, tp1); tp.add(tp.kCommitSync, tp1, tp.now()); }
+        }
     }
     if (ple_stage())
         for (int t = 0; t < S;) {

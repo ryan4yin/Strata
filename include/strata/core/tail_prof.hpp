@@ -3,7 +3,9 @@
 // every point is one predicted branch.
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 
 namespace strata::core {
@@ -38,8 +40,8 @@ struct TailProf {
     double ms[kN] = {};
     long long windows = 0;
     long long ple_checked = 0, ple_bad = 0;   // STRATA_DBG_PLECHECK: gathered PLE rows re-read and compared
-    long long pair_rounds = 0, draft_checked = 0, draft_bad = 0;
-    long long early_rounds = 0, early_bad = 0;   // STRATA_FUSE_DRAFTEARLY: pairs launched before the commit, mispredicted   // STRATA_FUSE_DRAFTHEAD / STRATA_DBG_DRAFTCHECK
+    long long pair_rounds = 0, draft_checked = 0, draft_bad = 0;   // STRATA_FUSE_DRAFTHEAD / STRATA_DBG_DRAFTCHECK
+    long long early_rounds = 0, early_bad = 0;   // STRATA_FUSE_DRAFTEARLY: pairs launched before the commit, mispredicted
     static bool ple_check() {
         static const bool v = [] { const char* e = std::getenv("STRATA_DBG_PLECHECK"); return e != nullptr && e[0] == '1'; }();
         return v;
@@ -58,6 +60,32 @@ struct TailProf {
 inline TailProf& tail_prof() {
     static TailProf p;
     return p;
+}
+
+// STRATA_DBG_ACOMMIT=1 (with STRATA_FUSE_ACOMMIT): the sessions whose batch commit is still running (commit_slot_prefixes
+// sets them, Verifier::wait_commit clears them); the session writers and readers outside the window check theirs
+struct AcommitDbg {
+    static constexpr int kN = 16;
+    std::atomic<const void*> s[kN]{};
+    std::atomic<long long> hits{0};
+    static bool on() {
+        static const bool v = [] { const char* e = std::getenv("STRATA_DBG_ACOMMIT"); return e != nullptr && e[0] == '1'; }();
+        return v;
+    }
+    void set(int i, const void* p) { if (i >= 0 && i < kN) s[i].store(p); }
+    void clear() { for (auto& x : s) x.store(nullptr); }
+    void check(const void* p, const char* site) {
+        if (!on() || p == nullptr) return;
+        for (auto& x : s)
+            if (x.load() == p) {
+                if (hits.fetch_add(1) < 8) std::fprintf(stderr, "strata: DBG_ACOMMIT: %s with its batch commit pending\n", site);
+                return;
+            }
+    }
+};
+inline AcommitDbg& acommit_dbg() {
+    static AcommitDbg d;
+    return d;
 }
 
 }  // namespace strata::core
