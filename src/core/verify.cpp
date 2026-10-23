@@ -516,6 +516,13 @@ bool fuse_shbel_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHBEL"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_FUSE_QGEMV=1: the router's bf16 GEMV and the q8_1 quantization of the same MoE input (the shared expert's
+// pair input) in one launch (bf16_gemv_fp32_mmvf_multi_quant): both read x, neither depends on the other.  The q8_1
+// bytes are native_quantize_q8_1's, so shared_expert_multi reads them instead of quantizing again.  Opt-in.
+bool fuse_qgemv_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_QGEMV"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 // STRATA_FUSE_SHGATE=1 (with STRATA_FUSE_COMBINE, outside the all-resident path): the shared expert's gate row rides in
 // the router's GEMV launch (bf16_gemv_fp32_mmvf_multi_aux) and its sigmoid + row scale in that combine
 // (native_moe_combine_multi_hits_mapped's shared_gate), as STRATA_LFUSE does on the all-resident path: two kernel nodes
@@ -2502,31 +2509,49 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                      pair_type_ok(w_su_pair) && n >= 2 && n <= 8 && N % 256 == 0 && g.n_ff % 2 == 0 &&
                                      (!sh_fork || sh_fork_late);
         bool sh_pair_fused = false;
-        const void* sh_pair_xq = nullptr;
+        const void* sh_q8_ready = nullptr;   // the MoE input's q8_1 image, when this window made it early
+        const bool qgemv_candidate = fuse_qgemv_on() && !q8_ffn && (!sh_fork || sh_fork_late);
+        bool qgemv_done = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                if (w_sgi != nullptr)
-                    sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
-                                                             logits_ + tb * NE, NE, N, NE, n,
-                                                             (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
-                if (!sg_ready)
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
+                if (q8_ffn && shbel_candidate) sh_q8_ready = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                if (qgemv_candidate) {   // quantize the MoE input with the router GEMV: both read x, no dependency
+                    void* q8 = qdedup ? (void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : (void*) (sh_fork ? sh_xq_ : xq_);
+                    const bool aux = w_sgi != nullptr;
+                    qgemv_done = bf16_gemv_fp32_mmvf_multi_quant(
+                        mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N, NE, n,
+                        aux ? (const uint16_t*) w_sgi->data : nullptr, aux ? sh_g_ + tb : nullptr, aux ? 1 : 0, mixed_ + tb * N,
+                        q8, (int64_t) n * N, cs);
+                    if (qgemv_done) {
+                        sg_ready = aux;
+                        sh_q8_ready = q8;
+                        qdedup_ready = qdedup;   // the q8_1 image is nat_xq_'s when qdedup chose it
+                    }
+                }
+                if (!qgemv_done) {
+                    if (w_sgi != nullptr)
+                        sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
+                                                                 logits_ + tb * NE, NE, N, NE, n,
+                                                                 (const uint16_t*) w_sgi->data, sh_g_ + tb, 1, cs);
+                    if (!sg_ready)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
+                                              NE, n, cs);
+                }
                 if (shbel_candidate) {   // the q8_1 image has to exist before the launch that also reads it
-                    if (q8_ffn) {
-                        sh_pair_xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
-                    } else if (qdedup) {
-                        quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-                        sh_pair_xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
-                        qdedup_ready = true;
-                    } else {
-                        void* q8 = sh_fork ? (void*) sh_xq_ : (void*) xq_;
-                        native_quantize_q8_1(xm, q8, (int) N, n, cs);
-                        sh_pair_xq = q8;
+                    if (sh_q8_ready == nullptr) {
+                        if (qdedup) {
+                            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                            sh_q8_ready = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                            qdedup_ready = true;
+                        } else {
+                            void* q8 = sh_fork ? (void*) sh_xq_ : (void*) xq_;
+                            native_quantize_q8_1(xm, q8, (int) N, n, cs);
+                            sh_q8_ready = q8;
+                        }
                     }
                     sh_pair_fused = native_mmvq_pair_router_bell(
                         w_sg_pair->native_type, w_su_pair->native_type, w_sg_pair->native_data, w_su_pair->native_data,
-                        sh_pair_xq, sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff, (int) N, (int) g.n_ff, n,
+                        sh_q8_ready, sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff, (int) N, (int) g.n_ff, n,
                         logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
                         hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr, (int) g.n_expert,
                         (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
@@ -2626,8 +2651,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
-                                    sh_pair_xq != nullptr
-                                        ? sh_pair_xq
+                                    sh_q8_ready != nullptr
+                                        ? sh_q8_ready
                                         : (qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr),
                                     (sg_ready ? 1 : 0) | (sh_pair_path ? 2 : 0) | (sh_pair_fused ? 4 : 0));
                 sg_gated_[grp] = sg_ready;
