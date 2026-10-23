@@ -4,6 +4,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_router.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -345,6 +346,107 @@ int test_pair(std::mt19937& rng, cudaStream_t s) {
     return bad + (ran == 0);
 }
 
+// STRATA_FUSE_SHBEL: native_mmvq_pair_router_bell (the router + bell in block 0, the gate/up pair's blocks at the
+// block prefix) vs native_mmvq_pair[_any] then native_router_top10_multi_bell, for every format pair and 2-8 columns.
+// All five outputs (y1, y2, ids, weights, the published rows/ids and the ring) are compared byte for byte; the
+// published-row buffers start from a sentinel because with every expert resident neither side writes them.
+int test_pair_routebell(std::mt19937& rng, cudaStream_t s) {
+    using namespace strata::kernels;
+    struct Fmt { int type, bytes; std::vector<int> halves; const char* name; };
+    const Fmt fmts[] = {{12, 144, {0, 2}, "Q4_K"}, {13, 176, {0, 2}, "Q5_K"}, {14, 210, {208}, "Q6_K"}, {23, 136, {0}, "IQ4_XS"}};
+    const int N = 2560, NO = 640, NE = 512, K = 10;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto make_dev = [&](const Fmt& f) {
+        const size_t wb = (size_t) (N / 256) * f.bytes * NO;
+        std::vector<uint8_t> w(wb);
+        for (auto& b : w) b = (uint8_t) rng();
+        for (size_t o = 0; o < wb; o += f.bytes)
+            for (const int h : f.halves) {   // 2^-12 .. 2^-6, either sign
+                const uint16_t v = (uint16_t) ((rng() & 1 ? 0x8000 : 0) | ((3 + rng() % 7) << 10) | (rng() & 1023));
+                std::memcpy(&w[o + h], &v, 2);
+            }
+        uint8_t* d = dev<uint8_t>(wb);
+        up(d, w);
+        return d;
+    };
+    int bad = 0, cases = 0, declined = 0;
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a; b < 4; ++b) {
+            uint8_t* d1 = make_dev(fmts[a]);
+            uint8_t* d2 = make_dev(fmts[b]);
+            for (int nc = 2; nc <= 8; ++nc) {
+                for (const int miss : {0, 1}) {
+                    std::vector<float> xv((size_t) nc * N), lg((size_t) nc * NE);
+                    for (auto& v : xv) v = nd(rng);
+                    for (auto& v : lg) v = nd(rng) * 2.0f;
+                    std::vector<int32_t> res(NE, 0);
+                    if (miss) for (int e = 0; e < NE; e += 5) res[(size_t) e] = -1;
+                    float* dx = dev<float>(xv.size());
+                    float* dl = dev<float>(lg.size());
+                    int32_t* dres = dev<int32_t>(NE);
+                    up(dx, xv);
+                    up(dl, lg);
+                    up(dres, res);
+                    uint8_t* xq = dev<uint8_t>((size_t) nc * (N / 32) * 36 + 256);
+                    native_quantize_q8_1(dx, xq, N, nc, s);
+                    const size_t nk = (size_t) nc * K, nx = (size_t) nc * N, no = (size_t) nc * NO;
+                    float *y1r = dev<float>(no), *y2r = dev<float>(no), *y1f = dev<float>(no), *y2f = dev<float>(no);
+                    int32_t *ir = dev<int32_t>(nk), *ifu = dev<int32_t>(nk), *ior = dev<int32_t>(nk), *iof = dev<int32_t>(nk);
+                    float *wr = dev<float>(nk), *wf = dev<float>(nk);
+                    float *xor_ = dev<float>(nx), *xof = dev<float>(nx);
+                    uint32_t *seqr = dev<uint32_t>(1), *seqf = dev<uint32_t>(1);
+                    for (float* o : {y1r, y2r, y1f, y2f, xof}) check(cudaMemset(o, 0x3c, (o == xof ? nx : no) * 4), "memset");
+                    check(cudaMemset(xor_, 0x3c, nx * 4), "memset");
+                    for (int32_t* o : {ir, ifu, ior, iof}) check(cudaMemset(o, 0x5a, nk * 4), "memset");
+                    for (float* o : {wr, wf}) check(cudaMemset(o, 0x5a, nk * 4), "memset");
+                    const uint32_t zero = 0;
+                    check(cudaMemcpy(seqr, &zero, 4, cudaMemcpyHostToDevice), "seq");
+                    check(cudaMemcpy(seqf, &zero, 4, cudaMemcpyHostToDevice), "seq");
+                    bool r = false;
+                    if (fmts[a].type == fmts[b].type)
+                        r = native_mmvq_pair_any(fmts[a].type, d1, d2, xq, y1r, y2r, N, NO, nc, s);
+                    else
+                        r = native_mmvq_pair_mixed(fmts[a].type, fmts[b].type, d1, d2, xq, y1r, y2r, N, NO, nc, s);
+                    native_router_top10_multi_bell(dl, ir, wr, nc, dx, dres, NE, (int64_t) nx, (int64_t) nk, xor_, ior, seqr, s);
+                    const bool f = native_mmvq_pair_router_bell(
+                        fmts[a].type, fmts[b].type, d1, d2, xq, y1f, y2f, N, NO, nc, dl, ifu, wf, nc, dx, dres, NE,
+                        (int64_t) nx, (int64_t) nk, xof, iof, seqf, s);
+                    check(cudaStreamSynchronize(s), "sync");
+                    ++cases;
+                    if (!r || !f) {
+                        std::printf("    *** pairbell %s/%s %d columns miss %d: declined (ref %d fused %d) ***\n", fmts[a].name,
+                                    fmts[b].name, nc, miss, (int) r, (int) f);
+                        ++declined;
+                    } else {
+                        const auto a1 = down(y1r, no), a2 = down(y2r, no), b1 = down(y1f, no), b2 = down(y2f, no);
+                        const auto vi = down(ir, nk);
+                        const auto vif = down(ifu, nk);
+                        const auto wo = down(wr, nk);
+                        const auto wof = down(wf, nk);
+                        const auto xo = down(xor_, nx), xof_h = down(xof, nx);
+                        const auto io = down(ior, nk), iof_h = down(iof, nk);
+                        const auto sr = down(seqr, 1), sf = down(seqf, 1);
+                        if (!same(a1, b1) || !same(a2, b2) || !same(vi, vif) || !same(wo, wof) || !same(xo, xof_h) ||
+                            !same(io, iof_h) || sr[0] != sf[0]) {
+                            std::printf("    *** pairbell %s/%s %d columns miss %d differs ***\n", fmts[a].name, fmts[b].name,
+                                        nc, miss);
+                            ++bad;
+                        }
+                    }
+                    cudaFree(dx); cudaFree(dl); cudaFree(dres); cudaFree(xq);
+                    cudaFree(y1r); cudaFree(y2r); cudaFree(y1f); cudaFree(y2f);
+                    cudaFree(ir); cudaFree(ifu); cudaFree(ior); cudaFree(iof);
+                    cudaFree(wr); cudaFree(wf); cudaFree(xor_); cudaFree(xof); cudaFree(seqr); cudaFree(seqf);
+                }
+            }
+            cudaFree(d1); cudaFree(d2);
+        }
+    }
+    std::printf("  %-60s %s (%d cases, %d declined)\n", "STRATA_FUSE_SHBEL router+bell+pair == pair + router_bell",
+                bad || declined || cases == 0 ? "*** NO ***" : "bitwise", cases, declined);
+    return bad + declined + (cases == 0);
+}
+
 // strict: every byte; nan_cases: also NaN inputs, where two NaN operands meet in one add and the hardware keeps one
 // of their sign / payload bits by operand order, which the compiler may commute: a NaN result must stay a NaN there
 bool g_nan = false;
@@ -475,6 +577,7 @@ int main(int argc, char** argv) {
     int bad = 0;
     if (only.empty() || only == "fetch") bad += test_fetch(rng, s);
     if (only.empty() || only == "pair") bad += test_pair(rng, s);
+    if (only.empty() || only == "pairbell") bad += test_pair_routebell(rng, s);
     if (only.empty() || only == "plan") bad += test_plan(rng, s);
     if (only.empty() || only == "combine") {
         for (const bool gated : {false, true}) {
