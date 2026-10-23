@@ -1615,12 +1615,11 @@ __global__ void b6_mmvq_rows_pair_kernel(const typename F::Block* __restrict__ w
 // contracts them (every instance, checked in its ISA): s = fma(d8_0, f0, 0), s = fma(d8_1, f1, s), tmp = fma(d, s, tmp).
 // The last iteration's loads past the row (threads with kbx >= blocks_per_row) and rows past n_out are clamped and
 // left out of the sums, as V1 leaves them out of its loops.
-template<int NCOLS, int ROWS, int NI, int CH = NI>
-__launch_bounds__(WARPS * WARP)
-__global__ void q6k_v2_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
-                              int n_in, int n_out) {
+template<int NCOLS, int ROWS, int NI, int CH>
+__device__ __forceinline__ void q6k_v2_rows(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, int n_in, int n_out, int blk) {   // rows ROWS blk..
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
-    const int row0 = ROWS * int(blockIdx.x);
+    const int row0 = ROWS * blk;
     const int blocks_per_row = n_in / Q6KTraits::DIV;
     const int x_stride = n_in / Q8K;
     const int iqs = tid % 32, kb0 = tid / 32;
@@ -1706,6 +1705,27 @@ __global__ void q6k_v2_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __
             if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
         }
     }
+}
+template<int NCOLS, int ROWS, int NI, int CH = NI>
+__launch_bounds__(WARPS * WARP)
+__global__ void q6k_v2_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                              int n_in, int n_out) {
+    q6k_v2_rows<NCOLS, ROWS, NI, CH>(w, x, y, n_in, n_out, int(blockIdx.x));
+}
+// STRATA_FUSE_PROJ: up to 4 Q6_K matrices of one input in one launch, segment s on blocks blk0[s]..blk0[s + 1] - 1,
+// each block q6k_v2_kernel's for its rows, so every output is what that matrix's own call gives
+struct Q6kProjSegs {
+    const Q6KBlock* w[4];
+    float* y[4];
+    int n_out[4];
+    int blk0[5];
+};
+template<int NCOLS, int NI, int CH = NI>
+__launch_bounds__(WARPS * WARP)
+__global__ void q6k_proj_kernel(const Q6kProjSegs sg, const Q81Block* __restrict__ x, int n_in) {
+    const int b = int(blockIdx.x);
+    const int k = (b >= sg.blk0[1]) + (b >= sg.blk0[2]) + (b >= sg.blk0[3]);
+    q6k_v2_rows<NCOLS, 2, NI, CH>(sg.w[k], x, sg.y[k], n_in, sg.n_out[k], b - sg.blk0[k]);
 }
 #endif
 int g_q6k_v2 = -1;   // native_mmvq_set_q6k_v2; -1 = STRATA_Q6K_V2
@@ -3570,6 +3590,66 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     }
     launch_check();
     return true;
+}
+
+bool native_mmvq_proj_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_PROJ"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+#if defined(__HIPCC__)
+namespace {
+template<int NCOLS>
+bool q6k_proj_go(const Q6kProjSegs& sg, const Q81Block* x, int n_in, cudaStream_t s) {
+    const int ni = (n_in / Q6KTraits::DIV + Q6KTraits::BPI - 1) / Q6KTraits::BPI;
+    const dim3 grid(unsigned(sg.blk0[4])), threads(WARP, WARPS);
+    switch (ni) {   // q6k_v2_go's instances
+        case 1: q6k_proj_kernel<NCOLS, 1><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        case 2: q6k_proj_kernel<NCOLS, 2><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        case 3: q6k_proj_kernel<NCOLS, 3><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        case 4: q6k_proj_kernel<NCOLS, 4><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        case 5: q6k_proj_kernel<NCOLS, 5><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        case 6: q6k_proj_kernel<NCOLS, 6, NCOLS >= 4 ? 2 : 6><<<grid, threads, 0, s>>>(sg, x, n_in); return true;
+        default: return false;
+    }
+}
+}  // namespace
+#endif
+
+bool native_mmvq_proj(const MmvqSeg* segs, int n_segs, const void* x_q8_1, int n_in, int ncols, void* stream) {
+#if defined(__HIPCC__)
+    if (n_segs < 2 || n_segs > 4 || ncols < 1 || ncols > 4 || n_in <= 0 || n_in % 256 != 0 || n_in / 256 < Q6KTraits::BPI ||
+        !x_q8_1 || !stream || !g_multi_exact || s26_tsum_on())
+        return false;
+    const auto& reg = q6_packed_registry();   // STRATA_Q6_PACKED tensors take their own kernel
+    Q6kProjSegs sg{};
+    int blk = 0;
+    for (int k = 0; k < n_segs; ++k) {
+        const MmvqSeg& g = segs[k];
+        if (g.type != 14 || g.n_out <= 0 || !g.w || !g.y || (!reg.empty() && reg.count(g.w))) return false;
+        sg.w[k] = static_cast<const Q6KBlock*>(g.w);
+        sg.y[k] = g.y;
+        sg.n_out[k] = g.n_out;
+        sg.blk0[k] = blk;
+        blk += (g.n_out + 1) / 2;
+    }
+    for (int k = n_segs; k <= 4; ++k) sg.blk0[k] = blk;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    bool ran = false;
+    switch (ncols) {
+        case 1: ran = q6k_proj_go<1>(sg, x, n_in, s); break;
+        case 2: ran = q6k_proj_go<2>(sg, x, n_in, s); break;
+        case 3: ran = q6k_proj_go<3>(sg, x, n_in, s); break;
+        case 4: ran = q6k_proj_go<4>(sg, x, n_in, s); break;
+        default: break;
+    }
+    if (ran) launch_check();
+    return ran;
+#else
+    (void) segs; (void) n_segs; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream;
+    return false;
+#endif
 }
 
 bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
