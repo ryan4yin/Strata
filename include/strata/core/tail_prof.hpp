@@ -42,6 +42,9 @@ struct TailProf {
     long long ple_checked = 0, ple_bad = 0;   // STRATA_DBG_PLECHECK: gathered PLE rows re-read and compared
     long long pair_rounds = 0, draft_checked = 0, draft_bad = 0;   // STRATA_FUSE_DRAFTHEAD / STRATA_DBG_DRAFTCHECK
     long long early_rounds = 0, early_bad = 0;   // STRATA_FUSE_DRAFTEARLY: pairs launched before the commit, mispredicted
+    // STRATA_FUSE_GDNDEFER: flushes (a slot's pending rows run by the commit's kernel); STRATA_DBG_B2CHECK: a pending
+    // slot's state after the next window against a shadow copy committed the old way, compared bit for bit
+    long long b2_flushes = 0, b2_checked = 0, b2_bad = 0;
     static bool ple_check() {
         static const bool v = [] { const char* e = std::getenv("STRATA_DBG_PLECHECK"); return e != nullptr && e[0] == '1'; }();
         return v;
