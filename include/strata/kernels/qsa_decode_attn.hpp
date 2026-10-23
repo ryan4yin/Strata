@@ -64,6 +64,15 @@ struct QsaAttnSlotPools {
 /// (n_q > kQsaAttnMaxSlots, mixed formats, the pre-sm_75 / gfx103x or gfx906 variants): the caller loops instead.
 bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// fuse-gdn (STRATA_FUSE_ATTNMERGE): qsa_decode_attn_batch's two passes apart, each the kernels qsa_decode_attn_batch
+/// picks (the environment's): `chunks` writes the n_q queries' partials into `scratch` (one
+/// qsa_decode_attn_scratch_floats(cap, s) stride each), `merge` turns them into `attn`.  A batch window runs the
+/// chunks of its rows one by one (each between its row's resolve) and merges them all in one launch: per query the
+/// same kernels on the same bytes as qsa_decode_attn_batch.
+void qsa_decode_attn_batch_chunks(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                  int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, void* stream);
+void qsa_decode_attn_batch_merge(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
+                                 int64_t n_q, void* stream);
 /// For src/kernels/qsa_merge_daily_parity.cpp only: qsa_decode_attn_batch's two passes apart, whatever the environment
 /// says.  `chunks_only` runs the chunk pass into `scratch` with `daily_chunk` 0: attn_chunk_kernel (upstream's default),
 /// 1: the Daily's (attn_chunk_kernel_pre75, what STRATA_ATTN_DAILY=1 picks on CUDA).  `merge_only` merges those
