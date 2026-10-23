@@ -586,6 +586,31 @@ void conv_groups_case(const std::vector<int>& ntok, bool commit, bool ab) {
     for (int i = 0; i < G; ++i) std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d", i ? "," : "", ntok[i]);
     std::snprintf(name, sizeof name, "gdn_conv_groups%s %s, groups of %s rows", ab ? " + a/b" : "", commit ? "commit" : "window", rows);
     report(name, same);
+    if (ab && !commit && std::getenv("STRATA_BENCH_CONV") != nullptr) {   // STRATA_BENCH_CONV=1: the separate vs the fused launches' times
+        cudaStream_t bs = nullptr;
+        ck(cudaStreamCreate(&bs), "stream");
+        cudaEvent_t e0, e1;
+        ck(cudaEventCreate(&e0), "event");
+        ck(cudaEventCreate(&e1), "event");
+        auto time = [&](auto&& f) {
+            for (int i = 0; i < 50; ++i) f();
+            ck(cudaEventRecord(e0, bs), "event");
+            for (int i = 0; i < 2000; ++i) f();
+            ck(cudaEventRecord(e1, bs), "event");
+            ck(cudaEventSynchronize(e1), "sync");
+            float ms = 0.f;
+            ck(cudaEventElapsedTime(&ms, e0, e1), "event");
+            return ms * 1000.f / 2000.f;
+        };
+        const float t_ab = time([&] { k::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, d_gr, d_br, n_embd, h_v, T, bs); });
+        const float t_cv = time([&] { k::gdn_conv_groups(cg, d_qkv, d_w, d_hf, C, 2 * h_k, 1e-6f, false, nullptr, d_wa, d_wb, d_dt,
+                                                         d_sa, d_gf, d_bf, n_embd, h_v, bs); });
+        const float t_fu = time([&] { k::gdn_conv_groups(cg, d_qkv, d_w, d_hf, C, 2 * h_k, 1e-6f, false, d_x, d_wa, d_wb, d_dt,
+                                                         d_sa, d_gf, d_bf, n_embd, h_v, bs); });
+        std::printf("  bench %s: ab_multi %.2f us, conv_groups %.2f us, fused %.2f us (per launch, back to back)\n", rows, t_ab,
+                    t_cv, t_fu);
+        ck(cudaStreamDestroy(bs), "stream");
+    }
 }
 // ---- 6. the window's indexer snapshots + appends in one launch (STRATA_FUSE_IDXAPP) ----
 void idx_slots_case(const std::vector<int>& ntok, const std::vector<int32_t>& pos, bool snap) {
@@ -836,6 +861,9 @@ int main() {
     bcommit_qsa_case({1, 3, 2}, {{11}, {29, 30, 31}, {14, -1}});
     for (const bool ab : {false, true}) {
         conv_groups_case({2, 2}, false, ab);
+        conv_groups_case({1, 1}, false, ab);
+        conv_groups_case({1, 1, 1, 1}, false, ab);
+        conv_groups_case({3, 3}, false, ab);
         conv_groups_case({1, 3, 2, 1, 1}, false, ab);
         conv_groups_case({4, 4}, false, ab);
         conv_groups_case({1, 1, 1, 1}, true, ab);
