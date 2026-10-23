@@ -63,9 +63,11 @@ struct GdnGroups {
 };
 /// gdn_step_norm_multi over several slots' groups at once (the generic kernel, grid.y = group; per group the
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
+/// fuse-gdn (STRATA_FUSE_GDNQ8): `xq_out` non-null (a window, not a commit) also writes the outputs' q8_1 image, row r
+/// of y at xq_out's row r - native_quantize_q8_1's bytes (gdn_step_norm_multi's xq_out, STRATA_QFUSE).
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream);
+                          void* stream, void* xq_out = nullptr);
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);

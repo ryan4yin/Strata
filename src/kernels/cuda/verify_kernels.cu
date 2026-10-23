@@ -336,6 +336,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         beta += (size_t) f * h_v;
         z += (size_t) f * S * h_v;
         y += (size_t) f * S * h_v;
+        if constexpr (Q) xq += (size_t) f * (S * h_v / 32);   // fuse-gdn STRATA_FUSE_GDNQ8: the group's rows' q8_1 too
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
     }
@@ -1290,7 +1291,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream) {
+                          void* stream, void* xq_out) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
@@ -1306,6 +1307,10 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
     if (commit)
         gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    else if (xq_out != nullptr)   // fuse-gdn STRATA_FUSE_GDNQ8: + the outputs' q8_1, as gdn_step_norm_multi's xq_out
+        gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0,
+            static_cast<GdnQ81*>(xq_out), groups);
     else
         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
