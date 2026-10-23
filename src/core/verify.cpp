@@ -433,6 +433,20 @@ bool fuse_qsasel_on() {
     return on;
 }
 
+// fuse-gdn: STRATA_FUSE_KVROWS=1 - a batch window's int8 K/V cells of every row in one launch per QSA layer
+// (kv_append_q8_rows: each row its own slot's pools, bitwise the per-row kv_append_q8_step calls)
+bool fuse_kvrows_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_KVROWS"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// fuse-gdn: STRATA_FUSE_ATTNMERGE=1 - a batch window's per-row QSA attention (KV streaming) runs each row's chunk pass
+// after its resolve and merges all rows' partials in one launch at the end (qsa_decode_attn_batch_chunks / _merge)
+bool fuse_attnmerge_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ATTNMERGE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
 #if defined(STRATA_USE_HIP)
@@ -1873,6 +1887,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
+                if (batch_rec_ && fuse_kvrows_on() && te - tb <= KvQ8Rows::kMax &&
+                    [&] {   // every row an int8 cache (the per-row loop's kv_append_q8_step case)
+                        for (int t = tb; t < te; ++t) {
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            if (sx.kv_hybrid || sx.kv_q4 || !sx.kv_int8) return false;
+                        }
+                        return true;
+                    }()) {
+                    KvQ8Rows kr;
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        const int j = t - tb;
+                        kr.k_q[j] = sx.k_q; kr.v_q[j] = sx.v_q; kr.k_scale[j] = sx.k_scale; kr.v_scale[j] = sx.v_scale;
+                        kr.table[j] = sx.page_table;
+                        kr.host[j] = sx.host;
+                    }
+                    kr.n = te - tb;
+                    kv_append_q8_rows(kr, step_ + tb * kStepCount, (int) kStepCount, kcur_ + tb * NKV * HD,
+                                      vcur_ + tb * NKV * HD, (int) (NKV * HD), s, cs);
+                } else
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
                     const int32_t* step_t = step_ + t * kStepCount;
@@ -1971,6 +2005,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     // STRATA_FUSE_QSASEL: the scores and the top-k of every row first, one launch each (they read the
                     // indexer and write the row's own scores / sel; the resolves and attention below do not touch those)
                     bool sel_done = false;
+                    // STRATA_FUSE_ATTNMERGE: the merges after all rows' chunk passes (the per-query stride is the
+                    // window's scratch stride, so one merge launch reads every row's partials where they are)
+                    const bool merge_late = fuse_attnmerge_on() &&
+                                            attn_scratch_floats_ == (int64_t) qsa_decode_attn_scratch_floats(cap_, s);
                     if (fuse_qsasel_on() && te - tb <= kQsaAttnMaxSlots) {
                         const float* pooled[kQsaAttnMaxSlots];
                         const float* dead[kQsaAttnMaxSlots];
@@ -1995,10 +2033,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         }
                         qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_ + t * kStepCount, 1, cap_, cs);
                         const QsaAttnPools px = qsa_attn_pools(sx);
+                        if (merge_late)
+                            qsa_decode_attn_batch_chunks(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_,
+                                                         step_ + t * kStepCount, cap_, s,
+                                                         attn_scratch_ + (size_t) t * attn_scratch_floats_, 1, cs);
+                        else
                         qsa_decode_attn_batch(qcur_ + t * NH * HD, px, sel_ + (size_t) t * cap_, step_ + t * kStepCount,
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                               attn_ + t * NH * HD, 1, cs);
                     }
+                    if (merge_late)   // every row's partials, written above, into its attention row
+                        qsa_decode_attn_batch_merge(step_ + tb * kStepCount, cap_, s,
+                                                    attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD,
+                                                    te - tb, cs);
                 } else {
                 if (!sidem) idx_select(cs);
                 else if (cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
