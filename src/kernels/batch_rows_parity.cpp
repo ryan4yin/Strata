@@ -6,7 +6,16 @@
 //      (int8 codes + scales, and fp16);
 //   3. gdn_step_norm_groups    == gdn_step_norm_multi, one call per slot group, in the window (all outputs, the state
 //      untouched) and in the 1-row commit (the state written after `keep` tokens).
+//   4. STRATA_FUSE_BCOMMIT: the batch commit's per-slot gdn_commit_layers == capture_commit_batch's per-layer, per-slot
+//      gdn_conv_commit + gdn_step_norm_multi (a 1-row group: the 0.1.39 kernel), and its per-slot
+//      native_qsa_indexer_append_steps_layers == the per-layer tail copy_from_mapped + one native_qsa_indexer_append per row.
+//   5. STRATA_FUSE_GDNCONV: gdn_conv_groups == gdn_conv_l2_multi per slot group (+ gdn_ab_multi over all rows), the
+//      window (history read only) and the 1-row self-commit (history written).
+//   6. STRATA_FUSE_IDXAPP: native_qsa_indexer_append_slots == per slot group the tail snapshot (copy_from_mapped) and
+//      one native_qsa_indexer_append per row (positions at the window's kStepCount stride).
 // Every case compares with memcmp, not a tolerance. Usage: batch_rows_parity
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -16,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -91,6 +101,18 @@ void scores_case(int rows) {
     char name[96];
     std::snprintf(name, sizeof name, "qsa_block_scores_rows, %d rows (own keys each)", rows);
     report(name, std::memcmp(a.data(), b.data(), n * 4) == 0);
+    // STRATA_FUSE_QSASEL: the streamed window's one scores launch over the rows (qsa_block_scores_slots)
+    {
+        float* d_sl = nullptr;
+        ck(cudaMalloc(&d_sl, n * 4), "malloc");
+        ck(cudaMemset(d_sl, 0, n * 4), "memset");
+        const bool ran = k::qsa_block_scores_slots(pooled.data(), dead.data(), d_q, d_steps, rows, max_blocks, s, d_sl, nullptr);
+        ck(cudaDeviceSynchronize(), "sync");
+        const std::vector<float> c = down(d_sl, n);
+        std::snprintf(name, sizeof name, "qsa_block_scores_slots, %d rows (own keys each)%s", rows, ran ? "" : " (declined)");
+        report(name, ran && std::memcmp(c.data(), b.data(), n * 4) == 0);
+        cudaFree(d_sl);
+    }
     // the window selects with one top-k launch over all rows (row-independent) where the per-row path ran one per row
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
     int32_t *i_rows = nullptr, *i_ref = nullptr;
@@ -252,6 +274,264 @@ void gdn_case(const std::vector<int>& ntok, bool commit) {
     std::snprintf(name, sizeof name, "gdn_step_norm_groups %s, groups of %s rows", commit ? "commit" : "window", rows);
     report(name, same);
 }
+// ---- 4. the batch commit graph, fused per slot (STRATA_FUSE_BCOMMIT) ----
+// slot groups of ntok[i] rows (rows contiguous, slot i's first row = the sum before it), each keeping keep[i] of them
+void bcommit_gdn_case(const std::vector<int>& ntok, const std::vector<int>& keepn) {
+    const int S = 128, h_k = 16, h_v = 48, L = 3, MT = k::kVerifyMaxT;
+    const int qk = S * h_k, C = 2 * qk + S * h_v, vd = S * h_v;
+    const int64_t conv_off = (int64_t) S * h_v * S, stride = conv_off + (int64_t) C * 3;
+    const int G = (int) ntok.size();
+    std::mt19937 rng(71 + G * 13 + ntok[0] * 3 + keepn[0]);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> qkv((size_t) L * MT * C), h((size_t) L * MT * C), gate((size_t) L * MT * h_v),
+        beta((size_t) L * MT * h_v), gamma(S, 1.0f);
+    for (auto& v : qkv) v = nd(rng);
+    for (auto& v : h) v = nd(rng) * 0.1f;
+    for (auto& v : gate) v = -(0.5f + 3.0f * (float) (rng() % 100) / 100.0f);
+    for (auto& v : beta) v = (float) (rng() % 100) / 100.0f;
+    const float *d_qkv = up(qkv), *d_h = up(h), *d_g = up(gate), *d_b = up(beta), *d_gm = up(gamma);
+    float *d_z = nullptr, *d_y = nullptr;
+    ck(cudaMalloc(&d_z, (size_t) MT * vd * 4), "malloc");
+    ck(cudaMalloc(&d_y, (size_t) MT * vd * 4), "malloc");
+    ck(cudaMemset(d_z, 0, (size_t) MT * vd * 4), "memset");
+    std::vector<std::vector<float>> st0(G);
+    std::vector<float*> ref(G), fus(G);
+    std::vector<int32_t*> keep(G);
+    for (int i = 0; i < G; ++i) {
+        st0[i].resize((size_t) stride * L);
+        for (auto& v : st0[i]) v = nd(rng) * 0.1f;
+        ref[i] = up(st0[i]);
+        fus[i] = up(st0[i]);
+        keep[i] = up(std::vector<int32_t>{keepn[i]});
+    }
+    // the reference: capture_commit_batch's loop, layer by layer, slot by slot
+    for (int l = 0; l < L; ++l)
+        for (int i = 0, first = 0; i < G; first += ntok[i], ++i) {
+            float* stl = ref[i] + (size_t) l * stride;
+            k::gdn_conv_commit(stl + conv_off, d_qkv + (size_t) l * MT * C + (size_t) first * C, C, keep[i], nullptr);
+            k::gdn_step_norm_multi(stl, d_h + (size_t) l * MT * C + (size_t) first * C, C,
+                                   d_g + (size_t) l * MT * h_v + (size_t) first * h_v,
+                                   d_b + (size_t) l * MT * h_v + (size_t) first * h_v, d_z + (size_t) first * vd, d_gm,
+                                   1e-6f, d_y + (size_t) first * vd, h_k, h_v, ntok[i], keep[i], nullptr,
+                                   ntok[i] > 1 ? ntok[i] : 0);
+        }
+    bool launched = true;
+    for (int i = 0, first = 0; i < G; first += ntok[i], ++i)
+        launched = launched && k::gdn_commit_layers(fus[i], stride, conv_off, d_qkv + (size_t) first * C, (int64_t) MT * C,
+                                                    d_h + (size_t) first * C, (int64_t) MT * C, d_g + (size_t) first * h_v,
+                                                    d_b + (size_t) first * h_v, (int64_t) MT * h_v, C, h_k, h_v, ntok[i], L,
+                                                    keep[i], nullptr);
+    ck(cudaDeviceSynchronize(), "sync");
+    bool same = launched;
+    for (int i = 0; i < G; ++i) {
+        const std::vector<float> a = down(ref[i], st0[i].size()), b = down(fus[i], st0[i].size());
+        same = same && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        if (keepn[i] > 0) same = same && std::memcmp(a.data(), st0[i].data(), a.size() * 4) != 0;   // it did commit
+    }
+    char name[96], rows[64] = "";
+    for (int i = 0; i < G; ++i)
+        std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d/%d", i ? "," : "", keepn[i], ntok[i]);
+    std::snprintf(name, sizeof name, "bcommit gdn_commit_layers per slot, keep/rows %s%s", rows, launched ? "" : " (declined)");
+    report(name, same);
+}
+
+void bcommit_qsa_case(const std::vector<int>& ntok, const std::vector<std::vector<int32_t>>& pos) {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int L = 3, MT = k::kVerifyMaxT, ID = (int) s.idx_dim, G = (int) ntok.size();
+    const int64_t MC = 1024, TS = (s.idx_block - 1) * ID, PR = (MC / s.idx_block + 1) * ID;
+    std::mt19937 rng(91 + G * 5 + ntok[0]);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    cudaStream_t cs = nullptr;
+    ck(cudaStreamCreate(&cs), "stream");
+    std::vector<float> raw((size_t) L * MT * ID), gam((size_t) L * ID);
+    for (auto& v : raw) v = nd(rng) * 2.0f;
+    for (auto& v : gam) v = 1.0f + 0.1f * nd(rng);
+    const float *d_raw = up(raw), *d_gam = up(gam);
+    struct Buf { float *tail, *dead, *pooled; int32_t* bpos; };
+    auto mk = [&](const std::vector<float>& tail0, const std::vector<float>& pooled0, const std::vector<float>& dead0) {
+        return Buf{up(tail0), up(dead0), up(pooled0), up(std::vector<int32_t>{7})};
+    };
+    std::vector<std::vector<Buf>> ref(G), fus(G);
+    std::vector<std::vector<const float*>> snap(G);
+    std::vector<const int32_t*> d_pos(G);
+    for (int i = 0; i < G; ++i) {
+        d_pos[i] = up(pos[i]);
+        for (int l = 0; l < L; ++l) {
+            std::vector<float> t0((size_t) TS), p0((size_t) PR), dd((size_t) ID), sn((size_t) TS);
+            for (auto& v : t0) v = nd(rng);
+            for (auto& v : p0) v = nd(rng);
+            for (auto& v : dd) v = nd(rng);
+            for (auto& v : sn) v = nd(rng);
+            ref[i].push_back(mk(t0, p0, dd));
+            fus[i].push_back(mk(t0, p0, dd));
+            snap[i].push_back(up(sn));
+        }
+    }
+    const k::RopeScaling sc;
+    for (int l = 0; l < L; ++l)   // the reference: capture_commit_batch's loop
+        for (int i = 0, first = 0; i < G; first += ntok[i], ++i) {
+            const Buf& b = ref[i][(size_t) l];
+            k::copy_from_mapped(b.tail, snap[i][(size_t) l], TS, cs);
+            const k::QsaIndexerBuffers ib{b.tail, b.dead, b.pooled, b.bpos};
+            for (int u = 0; u < ntok[i]; ++u)
+                k::native_qsa_indexer_append(d_raw + (size_t) (l * MT + first + u) * ID, d_pos[i] + u, 0,
+                                             d_gam + (size_t) l * ID, 1e-6f, ib, s, MC, sc, cs);
+        }
+    for (int i = 0, first = 0; i < G; first += ntok[i], ++i) {
+        k::QsaIndexerLayers il;
+        for (int l = 0; l < L; ++l) {
+            const Buf& b = fus[i][(size_t) l];
+            il.gamma[l] = d_gam + (size_t) l * ID;
+            il.tail_src[l] = snap[i][(size_t) l];
+            il.tail[l] = b.tail; il.dead[l] = b.dead; il.pooled[l] = b.pooled; il.block_pos[l] = b.bpos;
+        }
+        k::native_qsa_indexer_append_steps_layers(d_raw + (size_t) first * ID, (int64_t) MT * ID, d_pos[i], 1, ntok[i], 0,
+                                                  1e-6f, il, L, s, MC, sc, cs);
+    }
+    ck(cudaStreamSynchronize(cs), "sync");
+    bool same = true;
+    for (int i = 0; i < G; ++i)
+        for (int l = 0; l < L; ++l) {
+            const Buf &a = ref[i][(size_t) l], &b = fus[i][(size_t) l];
+            auto eq = [&](const float* x, const float* y, int64_t n) {
+                const std::vector<float> hx = down(x, (size_t) n), hy = down(y, (size_t) n);
+                return std::memcmp(hx.data(), hy.data(), (size_t) n * 4) == 0;
+            };
+            same = same && eq(a.tail, b.tail, TS) && eq(a.dead, b.dead, ID) && eq(a.pooled, b.pooled, PR) &&
+                   down(a.bpos, 1)[0] == down(b.bpos, 1)[0];
+        }
+    ck(cudaStreamDestroy(cs), "stream");
+    char name[96], rows[64] = "";
+    for (int i = 0; i < G; ++i)
+        std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d@%d", i ? "," : "", ntok[i], pos[i][0]);
+    std::snprintf(name, sizeof name, "bcommit indexer append_steps_layers per slot, rows@pos %s", rows);
+    report(name, same);
+}
+// ---- 5. the window's conv of every slot group in one launch (STRATA_FUSE_GDNCONV) ----
+void conv_groups_case(const std::vector<int>& ntok, bool commit, bool ab) {
+    const int S = 128, h_k = 16, h_v = 48, n_embd = 2048;
+    const int C = 2 * S * h_k + S * h_v;
+    const int G = (int) ntok.size();
+    int T = 0;
+    for (int n : ntok) T += n;
+    std::mt19937 rng(131 + T * 3 + G + commit * 7 + ab);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto bf = [&](float f) { uint32_t u; std::memcpy(&u, &f, 4); return (uint16_t) (u >> 16); };
+    std::vector<float> qkv((size_t) T * C), w((size_t) C * 4), x((size_t) T * n_embd), dt(h_v), sa(h_v);
+    std::vector<uint16_t> wa((size_t) h_v * n_embd), wb((size_t) h_v * n_embd);
+    for (auto& v : qkv) v = nd(rng);
+    for (auto& v : w) v = nd(rng) * 0.5f;
+    for (auto& v : x) v = nd(rng);
+    for (auto& v : dt) v = nd(rng);
+    for (auto& v : sa) v = -std::fabs(nd(rng));
+    for (auto& v : wa) v = bf(nd(rng) * 0.05f);
+    for (auto& v : wb) v = bf(nd(rng) * 0.05f);
+    const float *d_qkv = up(qkv), *d_w = up(w), *d_x = up(x), *d_dt = up(dt), *d_sa = up(sa);
+    const uint16_t *d_wa = up(wa), *d_wb = up(wb);
+    std::vector<std::vector<float>> h0(G);
+    std::vector<float*> hr(G), hf(G);
+    k::GdnConvGroups cg;
+    for (int i = 0, first = 0; i < G; first += ntok[i], ++i) {
+        h0[i].resize((size_t) C * 3);
+        for (auto& v : h0[i]) v = nd(rng);
+        hr[i] = up(h0[i]);
+        hf[i] = up(h0[i]);
+        cg.hist[i] = hf[i];
+        cg.first[i] = first;
+        cg.ntok[i] = ntok[i];
+    }
+    cg.n = G;
+    auto zeros = [](size_t n) { float* d = nullptr; ck(cudaMalloc(&d, n * 4), "malloc"); ck(cudaMemset(d, 0, n * 4), "memset"); return d; };
+    float *d_hr = zeros((size_t) T * C), *d_hf = zeros((size_t) T * C), *d_gr = zeros((size_t) T * h_v),
+          *d_gf = zeros((size_t) T * h_v), *d_br = zeros((size_t) T * h_v), *d_bf = zeros((size_t) T * h_v);
+    for (int i = 0; i < G; ++i)   // the reference: the window's per-group calls, then the a/b over all rows
+        k::gdn_conv_l2_multi(hr[i], d_qkv + (size_t) cg.first[i] * C, d_w, d_hr + (size_t) cg.first[i] * C, C, 2 * h_k, 1e-6f,
+                             ntok[i], nullptr, 0, commit);
+    if (ab) k::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, d_gr, d_br, n_embd, h_v, T, nullptr);
+    k::gdn_conv_groups(cg, d_qkv, d_w, d_hf, C, 2 * h_k, 1e-6f, commit, ab ? d_x : nullptr, d_wa, d_wb, d_dt, d_sa, d_gf, d_bf,
+                       n_embd, h_v, nullptr);
+    ck(cudaDeviceSynchronize(), "sync");
+    auto eq = [](const float* a, const float* b, size_t n) {
+        const std::vector<float> x = down(a, n), y = down(b, n);
+        return std::memcmp(x.data(), y.data(), n * 4) == 0;
+    };
+    bool same = eq(d_hr, d_hf, (size_t) T * C);
+    if (ab) same = same && eq(d_gr, d_gf, (size_t) T * h_v) && eq(d_br, d_bf, (size_t) T * h_v);
+    for (int i = 0; i < G; ++i) {
+        same = same && eq(hr[i], hf[i], (size_t) C * 3);
+        const std::vector<float> a = down(hf[i], (size_t) C * 3);
+        same = same && (std::memcmp(a.data(), h0[i].data(), a.size() * 4) == 0) == !commit;   // written only by a commit
+    }
+    char name[96], rows[64] = "";
+    for (int i = 0; i < G; ++i) std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d", i ? "," : "", ntok[i]);
+    std::snprintf(name, sizeof name, "gdn_conv_groups%s %s, groups of %s rows", ab ? " + a/b" : "", commit ? "commit" : "window", rows);
+    report(name, same);
+}
+// ---- 6. the window's indexer snapshots + appends in one launch (STRATA_FUSE_IDXAPP) ----
+void idx_slots_case(const std::vector<int>& ntok, const std::vector<int32_t>& pos, bool snap) {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int ID = (int) s.idx_dim, G = (int) ntok.size(), KS = k::kStepCount;
+    const int64_t MC = 1024, TS = (s.idx_block - 1) * ID, PR = (MC / s.idx_block + 1) * ID;
+    int T = 0;
+    for (int n : ntok) T += n;
+    std::mt19937 rng(171 + T * 3 + G + snap);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    cudaStream_t cs = nullptr;
+    ck(cudaStreamCreate(&cs), "stream");
+    std::vector<float> raw((size_t) T * ID), gam((size_t) ID);
+    for (auto& v : raw) v = nd(rng) * 2.0f;
+    for (auto& v : gam) v = 1.0f + 0.1f * nd(rng);
+    std::vector<int32_t> steps((size_t) T * KS, -7);
+    for (int t = 0; t < T; ++t) steps[(size_t) t * KS + k::kStepPos] = pos[(size_t) t];
+    const float *d_raw = up(raw), *d_gam = up(gam);
+    const int32_t* d_steps = up(steps);
+    struct Buf { float *tail, *dead, *pooled, *snap; int32_t* bpos; };
+    std::vector<Buf> ref, fus;
+    for (int i = 0; i < G; ++i) {
+        std::vector<float> t0((size_t) TS), p0((size_t) PR), dd((size_t) ID), sn((size_t) TS, -1.0f);
+        for (auto& v : t0) v = nd(rng);
+        for (auto& v : p0) v = nd(rng);
+        for (auto& v : dd) v = nd(rng);
+        ref.push_back(Buf{up(t0), up(dd), up(p0), up(sn), up(std::vector<int32_t>{5})});
+        fus.push_back(Buf{up(t0), up(dd), up(p0), up(sn), up(std::vector<int32_t>{5})});
+    }
+    const k::RopeScaling sc;
+    k::QsaIndexerSlots g;
+    for (int i = 0, first = 0; i < G; first += ntok[i], ++i) {   // the reference: the window's per-slot snapshot, per-row appends
+        const Buf& b = ref[(size_t) i];
+        if (snap) k::copy_from_mapped(b.snap, b.tail, TS, cs);
+        const k::QsaIndexerBuffers ib{b.tail, b.dead, b.pooled, b.bpos};
+        for (int t = first; t < first + ntok[i]; ++t)
+            k::native_qsa_indexer_append(d_raw + (size_t) t * ID, d_steps + (size_t) t * KS + k::kStepPos, 0, d_gam, 1e-6f, ib,
+                                         s, MC, sc, cs);
+        const Buf& f = fus[(size_t) i];
+        g.raw[i] = d_raw + (size_t) first * ID;
+        g.pos[i] = d_steps + (size_t) first * KS + k::kStepPos;
+        g.n_steps[i] = ntok[i];
+        g.snap[i] = snap ? f.snap : nullptr;
+        g.tail[i] = f.tail; g.dead[i] = f.dead; g.pooled[i] = f.pooled; g.block_pos[i] = f.bpos;
+        g.max_cells[i] = (int) MC;
+    }
+    g.n = G;
+    k::native_qsa_indexer_append_slots(g, KS, 0, d_gam, 1e-6f, s, sc, cs);
+    ck(cudaStreamSynchronize(cs), "sync");
+    auto eq = [](const float* a, const float* b, int64_t n) {
+        const std::vector<float> x = down(a, (size_t) n), y = down(b, (size_t) n);
+        return std::memcmp(x.data(), y.data(), (size_t) n * 4) == 0;
+    };
+    bool same = true;
+    for (int i = 0; i < G; ++i) {
+        const Buf &a = ref[(size_t) i], &b = fus[(size_t) i];
+        same = same && eq(a.tail, b.tail, TS) && eq(a.dead, b.dead, ID) && eq(a.pooled, b.pooled, PR) &&
+               eq(a.snap, b.snap, TS) && down(a.bpos, 1)[0] == down(b.bpos, 1)[0];
+    }
+    ck(cudaStreamDestroy(cs), "stream");
+    char name[96], rows[64] = "";
+    for (int i = 0, first = 0; i < G; first += ntok[i], ++i)
+        std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d@%d", i ? "," : "", ntok[i], pos[(size_t) first]);
+    std::snprintf(name, sizeof name, "indexer append_slots%s, rows@pos %s", snap ? " + snapshot" : "", rows);
+    report(name, same);
+}
 }  // namespace
 
 int main() {
@@ -269,6 +549,32 @@ int main() {
     gdn_case({1}, true);
     gdn_case({1, 1, 1, 1}, true);
     gdn_case({1, 1, 1, 1, 1, 1, 1, 1}, true);
+    bcommit_gdn_case({2, 2}, {2, 2});
+    bcommit_gdn_case({2, 2}, {1, 2});
+    bcommit_gdn_case({2, 2}, {0, 1});
+    bcommit_gdn_case({1, 1}, {1, 1});
+    bcommit_gdn_case({1, 1, 1, 1}, {1, 0, 1, 1});
+    bcommit_gdn_case({1, 3, 2}, {1, 3, 1});
+    bcommit_gdn_case({4}, {3});
+    // positions: a block completes at the second row (reads the restored tail), a row not kept (-1), the spare (0)
+    bcommit_qsa_case({2, 2}, {{102, 103}, {57, 58}});
+    bcommit_qsa_case({2, 2}, {{103, -1}, {58, 59}});
+    bcommit_qsa_case({1, 1}, {{7}, {0}});
+    bcommit_qsa_case({1, 3, 2}, {{11}, {29, 30, 31}, {14, -1}});
+    for (const bool ab : {false, true}) {
+        conv_groups_case({2, 2}, false, ab);
+        conv_groups_case({1, 3, 2, 1, 1}, false, ab);
+        conv_groups_case({4, 4}, false, ab);
+        conv_groups_case({1, 1, 1, 1}, true, ab);
+        conv_groups_case({1}, true, ab);
+        conv_groups_case({1, 1, 1, 1, 1, 1, 1}, false, ab);
+    }
+    for (const bool snap : {true, false}) {
+        idx_slots_case({2, 2}, {102, 103, 57, 58}, snap);
+        idx_slots_case({1, 1, 1, 1}, {3, 0, 7, 11}, snap);
+        idx_slots_case({1, 3, 2}, {11, 29, 30, 31, 14, -1}, snap);
+        idx_slots_case({4, 4}, {200, 201, 202, 203, 33, 34, 35, 36}, snap);
+    }
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;
 }
