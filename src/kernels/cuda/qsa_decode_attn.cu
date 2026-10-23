@@ -554,20 +554,29 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
     }
 }
 
-template <int KV_MODE, int NC_ = 2, bool DPP_ = false>
-__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, QsaAttnPools p,
+// fuse-gdn (STRATA_FUSE_QSAWAVE): PT = QsaAttnWave - blockIdx.z attends with its own pools (wave.p[z]) as the window's
+// row wave.row[z] (its q row, selection, step and scratch); PT = QsaAttnPools is the kernel as it was
+__device__ __forceinline__ const QsaAttnPools& wave_pools(const QsaAttnPools& p) { return p; }
+__device__ __forceinline__ unsigned wave_row(const QsaAttnPools&) { return blockIdx.z; }
+__device__ __forceinline__ const QsaAttnPools& wave_pools(const QsaAttnWave& w) { return w.p[blockIdx.z]; }
+__device__ __forceinline__ unsigned wave_row(const QsaAttnWave& w) { return (unsigned) w.row[blockIdx.z]; }
+
+template <int KV_MODE, int NC_ = 2, bool DPP_ = false, typename PT = QsaAttnPools>
+__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* __restrict__ q, PT pp,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
                                                              int page_size, float scale, float* __restrict__ part_acc,
                                                              float* __restrict__ part_m, float* __restrict__ part_l,
                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
-    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
-    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
-    ids += (size_t) blockIdx.z * (size_t) cap;
-    step += (size_t) blockIdx.z * kStepCount;
-    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
-    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
-    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    const QsaAttnPools& p = wave_pools(pp);
+    const unsigned z = wave_row(pp);
+    // batched form: query z, with its own q row, selection, step and scratch
+    q += (size_t) z * (size_t) (n_kv_heads * G) * HD;
+    ids += (size_t) z * (size_t) cap;
+    step += (size_t) z * kStepCount;
+    part_acc += (size_t) z * (size_t) scratch_stride;
+    part_m += (size_t) z * (size_t) scratch_stride;
+    part_l += (size_t) z * (size_t) scratch_stride;
     __shared__ __align__(16) float sq[G][HD];     // 12 KB: this KV head's query heads (dead once the scores are done)
     __shared__ float sp[G][CHUNK];                // scores
     __shared__ long long srow[CHUNK];             // pool row of each cell (page, kv head, slot)
@@ -1126,6 +1135,47 @@ void qsa_decode_attn_batch_merge(const int32_t* steps, int64_t cap, const QsaSha
         std::fprintf(stderr, "qsa_decode_attn_batch_merge: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+
+bool qsa_decode_attn_wave_chunks(const float* q, const QsaAttnWave& wave, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, void* stream) {
+    if (wave.n <= 0) return true;
+    if (wave.n > kAttnRowsMax || s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch ||
+        !ids || !steps || !q) {
+        std::fprintf(stderr, "qsa_decode_attn_wave_chunks: unsupported geometry or missing buffers\n");
+        std::exit(1);
+    }
+#if defined(__HIPCC__) && defined(STRATA_ATTN_PRE75_BUILT) && !defined(STRATA_HIP_GFX906)
+    // only where launch_chunks_batch (kernel -1) would run attn_chunk_kernel_pre75<M, 8, true>
+    if (lane_cell_attn() || !pre75_attn()) return false;
+    const int kv_mode = attn_kv_mode(wave.p[0]);
+    for (int z = 0; z < wave.n; ++z)
+        if (!wave.p[z].page_table || attn_kv_mode(wave.p[z]) != kv_mode || wave.row[z] < 0) return false;
+    const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
+    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    float* part_acc = scratch;
+    float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_chunks * s.n_head;
+    const float scale = 1.0f / sqrtf((float) HD);
+    const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) wave.n);
+    cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_ATTN_WAVE(M) attn_chunk_kernel_pre75<M, 8, true, QsaAttnWave><<<grid, THREADS, 0, st>>>(q, wave, ids, \
+        steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+    if (kv_mode == 3) STRATA_ATTN_WAVE(3);
+    else if (kv_mode == 2) STRATA_ATTN_WAVE(2);
+    else if (kv_mode == 1) STRATA_ATTN_WAVE(1);
+    else STRATA_ATTN_WAVE(0);
+#undef STRATA_ATTN_WAVE
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_decode_attn_wave_chunks: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+#else
+    (void) stream;
+    return false;
+#endif
 }
 
 bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,

@@ -39,6 +39,14 @@ struct QsaAttnPoolsRows {
     int n = 0;
 };
 
+/// fuse-gdn (STRATA_FUSE_QSAWAVE): rows of a batch window that attend over different slots' pools at once - row
+/// wave.row[z] of the window (its q, selection, step and scratch at the window's bases + row strides) with pools wave.p[z].
+struct QsaAttnWave {
+    QsaAttnPools p[kAttnRowsMax];
+    int row[kAttnRowsMax] = {};
+    int n = 0;
+};
+
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
@@ -71,6 +79,11 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
 /// same kernels on the same bytes as qsa_decode_attn_batch.
 void qsa_decode_attn_batch_chunks(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                   int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, void* stream);
+/// fuse-gdn (STRATA_FUSE_QSAWAVE): qsa_decode_attn_batch_chunks for the wave's rows in one launch - per row the same
+/// kernel on the same bytes.  Only where that kernel is HIP's attn_chunk_kernel_pre75 (gfx103x / gfx12); elsewhere it
+/// launches nothing and returns false (the caller runs the per-row calls).
+bool qsa_decode_attn_wave_chunks(const float* q, const QsaAttnWave& wave, const int32_t* ids, const int32_t* steps,
+                                 int64_t cap, const QsaShapes& s, float* scratch, void* stream);
 void qsa_decode_attn_batch_merge(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
                                  int64_t n_q, void* stream);
 /// For src/kernels/qsa_merge_daily_parity.cpp only: qsa_decode_attn_batch's two passes apart, whatever the environment

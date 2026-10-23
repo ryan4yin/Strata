@@ -218,6 +218,23 @@ void attn_case(int rows, bool int8) {
         char nm[96];
         std::snprintf(nm, sizeof nm, "attn chunks per row + one merge, %d rows, %s pools", rows, int8 ? "int8" : "fp16");
         report(nm, std::memcmp(a.data(), b.data(), n * 4) == 0);
+        // STRATA_FUSE_QSAWAVE: the chunk passes by waves of non-adjacent rows (even rows, then odd), one launch each
+        ck(cudaMemset(scratch2, 0, (size_t) rows * scr * 4), "memset");
+        ck(cudaMemset(d_late, 0, n * 4), "memset");
+        bool ran = true;
+        for (int par = 0; par < 2; ++par) {
+            k::QsaAttnWave wv;
+            for (int r = par; r < rows; r += 2) { wv.p[wv.n] = pr.p[r]; wv.row[wv.n++] = r; }
+            ran = k::qsa_decode_attn_wave_chunks(d_q, wv, d_ids, d_steps, cap, s, scratch2, nullptr) && ran;
+        }
+        k::qsa_decode_attn_batch_merge(d_steps, cap, s, scratch2, d_late, rows, nullptr);
+        ck(cudaDeviceSynchronize(), "sync");
+        const std::vector<float> w = down(d_late, n);
+        if (ran) {
+            std::snprintf(nm, sizeof nm, "attn wave chunks (even, odd rows) + one merge, %d rows, %s", rows, int8 ? "int8" : "fp16");
+            report(nm, std::memcmp(w.data(), b.data(), n * 4) == 0);
+        } else
+            std::printf("  attn wave chunks: declined (this card does not run attn_chunk_kernel_pre75)\n");
         cudaFree(scratch2);
         cudaFree(d_late);
     }

@@ -14,6 +14,9 @@
 //      is filled by a shared-memory atomicAdd, so the block <-> victim pairing (and from then on which slots the hits
 //      stamp) varies from run to run on either path - STRATA_KV_PARITY_CONTROL=1 resolves the second layer with the
 //      copy kernel too and counts the calls after which the two maps differ.
+//   6. STRATA_FUSE_QSAWAVE: two more streamed layers resolved together by kv_stream_resolve_rows (one block per
+//      layer, layer z resolving query z of the batch; copy kernel and fused copy on alternate batches), each layer's
+//      attention of its query BITWISE equal to the resident pool's, maps consistent, no overflow.
 // INT8, FP16, Q4_0 (PR #21) and hybrid K8V4 pools; K8V4's appends are the engine's folded calls (layer.cpp), its host
 // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
 #include "strata/kernels/kv_q4.hpp"
@@ -142,10 +145,11 @@ bool run(int fmt) {
     std::mt19937 rng(7 + 4 * fmt);
     std::normal_distribution<float> nd(0.f, 1.f);
 
-    Pools ref, slots, host, slots2;
+    Pools ref, slots, host, slots2, slots3[2];
     ref.alloc(n_blocks, s, fmt, false);
     slots.alloc(n_slots, s, fmt, false);
     slots2.alloc(n_slots, s, fmt, false);
+    for (Pools& p3 : slots3) p3.alloc(n_slots, s, fmt, false);
     host.alloc(n_blocks, s, fmt, true);
     int32_t* ident = dalloc<int32_t>(n_blocks);
     {
@@ -166,6 +170,15 @@ bool run(int fmt) {
     m2.miss_block = dalloc<int32_t>(n_slots); m2.miss_slot = dalloc<int32_t>(n_slots);
     m2.ctl = dalloc<int32_t>(k::kKvCtlInts);
     k::kv_stream_reset(m2, nullptr);
+    k::KvStreamMap m3[2] = {m, m};   // 6: two layers resolved in one kv_stream_resolve_rows launch
+    for (k::KvStreamMap& mm : m3) {
+        mm.page_table = dalloc<int32_t>(n_blocks);
+        mm.slot_block = dalloc<int32_t>(n_slots); mm.slot_stamp = dalloc<int32_t>(n_slots); mm.slot_ref = dalloc<int32_t>(n_slots);
+        mm.miss_block = dalloc<int32_t>(n_slots); mm.miss_slot = dalloc<int32_t>(n_slots);
+        mm.ctl = dalloc<int32_t>(k::kKvCtlInts);
+        k::kv_stream_reset(mm, nullptr);
+    }
+    int rows_bad = 0, rows_calls = 0;
     int fused_bad = 0, pairing_moved = 0;
     static const bool control = std::getenv("STRATA_KV_PARITY_CONTROL") != nullptr;
     auto down8 = [](const void* x, size_t n) {
@@ -198,6 +211,7 @@ bool run(int fmt) {
         append(ref, ident, step, kc, vc, s, fmt, nullptr);
         append(slots, m.page_table, step, kc, vc, s, fmt, &host.p);
         append(slots2, m2.page_table, step, kc, vc, s, fmt, &host.p);   // (the host copy gets the same bytes twice)
+        for (int z = 0; z < 2; ++z) append(slots3[z], m3[z].page_table, step, kc, vc, s, fmt, &host.p);
         if (pos % 131 != 130 && pos != N - 1) continue;
         // a batch: n_q queries at the last n_q positions (as a verify window), each with its own selection
         const int n_q = 1 + (int) (rng() % NQ);
@@ -253,6 +267,32 @@ bool run(int fmt) {
             if (!same && fused_bad++ < 5)
                 std::fprintf(stderr, "  %s pos %lld n_q %d: fused resolve + copy: attention or map wrong\n", name, (long long) pos, n_q);
         }
+        if (n_q >= 2) {   // 6. layers m3[0], m3[1] resolve queries 0 and 1 in one launch, then attend them
+            k::KvResolveRows kr;
+            for (int z = 0; z < 2; ++z) {
+                kr.m[z] = m3[z];
+                kr.slots[z] = slots3[z].attn(m3[z].page_table);
+                kr.host[z] = host.p;
+                kr.row[z] = z;
+            }
+            kr.n = 2;
+            k::kv_stream_resolve_rows(kr, fmt, ids, steps, cap, s, nullptr, (rows_calls & 1) == 1);
+            ++rows_calls;
+            for (int z = 0; z < 2; ++z) {
+                k::qsa_decode_attn_batch(q + (size_t) z * NH * D, slots3[z].attn(m3[z].page_table), ids + (size_t) z * cap,
+                                         steps + (size_t) z * k::kStepCount, cap, s, scratch, out_str, 1, nullptr);
+                ck(cudaDeviceSynchronize(), "rows batch");
+                ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "b3");
+                bool same = std::memcmp(a.data() + (size_t) z * NH * D, b2.data(), (size_t) NH * D * 4) == 0;
+                const std::vector<uint8_t> t3 = down8(m3[z].page_table, n_blocks * 4), s3 = down8(m3[z].slot_block, n_slots * 4);
+                const int32_t* p3 = (const int32_t*) t3.data();
+                const int32_t* q3 = (const int32_t*) s3.data();
+                for (int64_t bk = 0; same && bk < n_blocks; ++bk)
+                    if (p3[bk] < -1 || p3[bk] >= n_slots || (p3[bk] >= 0 && q3[p3[bk]] != bk)) same = false;
+                if (!same && rows_bad++ < 5)
+                    std::fprintf(stderr, "  %s pos %lld layer %d: resolve rows: attention or map wrong\n", name, (long long) pos, z);
+            }
+        }
         ++batches;
     }
     const k::KvStreamCounters c = k::kv_stream_counters(m);
@@ -267,6 +307,10 @@ bool run(int fmt) {
                 fused_bad ? "WRONG" : "bitwise", batches, (unsigned long long) c2.misses, (unsigned long long) c.misses,
                 (int) c2.overflow, pairing_moved);
     bad += fused_bad;
+    for (int z = 0; z < 2; ++z) if (k::kv_stream_counters(m3[z]).overflow) ++rows_bad;
+    std::printf("  %s resolve rows (STRATA_FUSE_QSAWAVE): 2 layers per launch, %d launches (copy kernel / fused copy "
+                "alternating), attention %s\n", name, rows_calls, rows_bad ? "WRONG" : "bitwise");
+    bad += rows_bad;
 
     // 5b. the fused copy's worst case, timed (not a check): every map reset, one query of full width - every block a miss
     {
