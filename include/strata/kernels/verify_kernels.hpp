@@ -129,6 +129,10 @@ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip,
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);
+/// STRATA_FUSE_PLAN: wait_flag_ge_or(flag, value, skip) then copy_i32_from_mapped_unless(dst, src, n, skip, value), one
+/// launch (the same words copied, the same wait).
+void wait_copy_i32_from_mapped_unless(const uint32_t* flag, uint32_t value, const uint32_t* skip, int32_t* dst,
+                                      const int32_t* src, long long n, void* stream);
 /// copy_from_mapped, or zeros when *skip == value (n a multiple of 4, 16-byte aligned).
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);
