@@ -97,7 +97,8 @@ void native_expert_nib_set_variant(int v);
 /// false when v is not a gu-proto id (>= 10) or the type has none.
 bool native_expert_nib_variant_attr(int v, int gu_type, int* regs, int* local_bytes, int* blocks_per_sm);
 /// STRATA_FUSE_SWIGLU_DOWN (1 on, 0 off, -1 the environment's): the down kernel makes the SwiGLU + q8_1 blocks of its
-/// entries from gate / up itself, one launch fewer per call (the same output, native_grouped_parity checks it).
+/// entries from gate / up itself, one launch fewer per call - in calls with grid_groups 1..4 only (the PCIe call; same output,
+/// native_grouped_parity checks it).
 /// Set before graph capture.
 void native_expert_set_fuse_sw_down(int on);
 
