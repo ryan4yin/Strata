@@ -3,6 +3,7 @@
 // random inputs (GPU, synthetic, no model).  Exit 0 when all match.
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -159,6 +160,69 @@ int test_fetch(std::mt19937& rng, cudaStream_t s) {
     return bad;
 }
 
+// STRATA_FUSE_SHPAIR (the binary run with STRATA_FUSE_SHPAIR=1): native_mmvq_pair for Q4_K / Q5_K / Q6_K / IQ4_XS
+// vs native_mmvq twice; where the pair declines, nothing may be written.  Random blocks, small finite fp16 scales.
+int test_pair(std::mt19937& rng, cudaStream_t s) {
+    using namespace strata::kernels;
+    const char* env = std::getenv("STRATA_FUSE_SHPAIR");
+    const bool any = env == nullptr || std::atoi(env) == 0;   // switch off: native_mmvq_pair_any (the same pairs)
+    struct Fmt { int type, bytes; std::vector<int> halves; const char* name; };
+    const Fmt fmts[] = {{12, 144, {0, 2}, "Q4_K"}, {13, 176, {0, 2}, "Q5_K"}, {14, 210, {208}, "Q6_K"}, {23, 136, {0}, "IQ4_XS"}};
+    int bad = 0, cases = 0, ran = 0;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (const auto& f : fmts) {
+        for (const int n_in : {2560, 1024}) {
+            for (const int n_out : {512, 640, 1536, 6144, 10240}) {
+                const size_t row = (size_t) (n_in / 256) * f.bytes, wb = row * n_out;
+                std::vector<uint8_t> w1(wb), w2(wb);
+                for (auto* w : {&w1, &w2}) {
+                    for (auto& b : *w) b = (uint8_t) rng();
+                    for (size_t o = 0; o < wb; o += f.bytes)
+                        for (const int h : f.halves) {   // 2^-12 .. 2^-6, either sign
+                            const uint16_t v = (uint16_t) ((rng() & 1 ? 0x8000 : 0) | ((3 + rng() % 7) << 10) | (rng() & 1023));
+                            std::memcpy(&(*w)[o + h], &v, 2);
+                        }
+                }
+                uint8_t *d1 = dev<uint8_t>(wb), *d2 = dev<uint8_t>(wb);
+                up(d1, w1);
+                up(d2, w2);
+                for (int nc = 2; nc <= 8; ++nc) {
+                    std::vector<float> x((size_t) nc * n_in);
+                    for (auto& v : x) v = nd(rng);
+                    float* dx = dev<float>(x.size());
+                    up(dx, x);
+                    uint8_t* xq = dev<uint8_t>((size_t) nc * (n_in / 32) * 36 + 256);
+                    native_quantize_q8_1(dx, xq, n_in, nc, s);
+                    const size_t no = (size_t) nc * n_out;
+                    float *a1 = dev<float>(no), *a2 = dev<float>(no), *b1 = dev<float>(no), *b2 = dev<float>(no);
+                    for (float* o : {a1, a2, b1, b2}) check(cudaMemset(o, 0x7f, no * 4), "memset");
+                    native_mmvq(f.type, d1, xq, a1, n_in, n_out, nc, s);
+                    native_mmvq(f.type, d2, xq, a2, n_in, n_out, nc, s);
+                    const bool r = any ? native_mmvq_pair_any(f.type, d1, d2, xq, b1, b2, n_in, n_out, nc, s)
+                                       : native_mmvq_pair(f.type, d1, d2, xq, b1, b2, n_in, n_out, nc, s);
+                    check(cudaStreamSynchronize(s), "sync");
+                    ++cases;
+                    ran += r;
+                    const auto ra = down(a1, no), rb = down(a2, no), ga = down(b1, no), gb = down(b2, no);
+                    std::vector<float> untouched(no);
+                    std::memset(untouched.data(), 0x7f, no * 4);
+                    if (r ? !(same(ra, ga) && same(rb, gb)) : !(same(ga, untouched) && same(gb, untouched))) {
+                        std::printf("    *** pair %s %d x %d, %d columns, %s: differs ***\n", f.name, n_in, n_out, nc,
+                                    r ? "paired" : "declined");
+                        ++bad;
+                    }
+                    cudaFree(dx); cudaFree(xq); cudaFree(a1); cudaFree(a2); cudaFree(b1); cudaFree(b2);
+                }
+                cudaFree(d1); cudaFree(d2);
+            }
+        }
+    }
+    std::printf("  %-60s %s (%d cases, %d paired)\n", any ? "native_mmvq_pair_any == native_mmvq x 2"
+                                                           : "STRATA_FUSE_SHPAIR native_mmvq_pair == native_mmvq x 2",
+                bad || ran == 0 ? "*** NO ***" : "bitwise", cases, ran);
+    return bad + (ran == 0);
+}
+
 // strict: every byte; nan_cases: also NaN inputs, where two NaN operands meet in one add and the hardware keeps one
 // of their sign / payload bits by operand order, which the compiler may commute: a NaN result must stay a NaN there
 bool g_nan = false;
@@ -288,6 +352,7 @@ int main(int argc, char** argv) {
     check(cudaStreamCreate(&s), "stream");
     int bad = 0;
     if (only.empty() || only == "fetch") bad += test_fetch(rng, s);
+    if (only.empty() || only == "pair") bad += test_pair(rng, s);
     if (only.empty() || only == "combine") {
         for (const bool gated : {false, true}) {
             bad += test_combine(rng, s, gated);
