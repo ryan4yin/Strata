@@ -1687,6 +1687,7 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int64_t HCN = HC * N;
     MtpDrafter* const ds[2] = {this, &peer};
+    static const bool gr_fuse = [] { const char* v = std::getenv("STRATA_FUSE_DRAFTPAIR_GR"); return v != nullptr && v[0] == '1'; }();
     try {
         // ---- the two selected rows: R, injection and the MLP input, one gather kernel
         mtp_pair_pick_rows(row_, peer.row_, R_, R_ + 2 * HCN, hn_, HCN, inj_, inj_ + 2 * HC, h2_, HC,
@@ -1762,12 +1763,16 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
             if (qfuse_hc) a.q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
             return a;
         };
-                    FusedGrArgs fa0 = mlp_args(0);
+        if (gr_fuse) {
+            FusedGrArgs fa[2] = {mlp_args(0), mlp_args(1)};
+            q8_mlp = fused_gr_read_multi(fa, 2, xn_, cs);
+        } else {
+            FusedGrArgs fa0 = mlp_args(0);
             const bool qa = fused_gr_read_multi(&fa0, 1, xn_, cs);
             FusedGrArgs fa1 = mlp_args(1);
             const bool qb = fused_gr_read_multi(&fa1, 1, xn_, cs);
             q8_mlp = qa && qb;
-
+        }
         if (!q8_mlp) native_quantize_q8_1(mixed_, xq_, (int) N, 2, cs);
         // ---- router: one multi-row GEMV and one top-10 pass when _EXPERT is on
                     for (int t = 0; t < 2; ++t) {
@@ -1829,12 +1834,16 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
             if (qfuse_hc) a.q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
             return a;
         };
-                    FusedGrArgs fa0 = mix_args(0);
+        if (gr_fuse) {
+            FusedGrArgs fa[2] = {mix_args(0), mix_args(1)};
+            q8_head = fused_gr_read_multi(fa, 2, xn_, cs);
+        } else {
+            FusedGrArgs fa0 = mix_args(0);
             const bool qa = fused_gr_read_multi(&fa0, 1, xn_, cs);
             FusedGrArgs fa1 = mix_args(1);
             const bool qb = fused_gr_read_multi(&fa1, 1, xn_, cs);
             q8_head = qa && qb;
-
+        }
         if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, 2, cs);
         // ---- the pair head and each slot's select (the DRAFTHEAD tail, in the same graph)
         const bool sub = dhead_ != nullptr;
