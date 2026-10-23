@@ -23,6 +23,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -262,6 +263,26 @@ void attn_case(int rows, bool int8) {
                 const std::vector<float> la = down(d_late, n), ga = down(g_fused, n), gb = down(g_ref, n);
                 std::snprintf(nm, sizeof nm, "attn one merge + gate, %d rows, %s (attn and gated)", rows, int8 ? "int8" : "fp16");
                 report(nm, std::memcmp(la.data(), b.data(), n * 4) == 0 && std::memcmp(ga.data(), gb.data(), n * 4) == 0);
+                // STRATA_FUSE_GATEMERGE_Q8: + gated's q8_1 == native_quantize_q8_1 of the separate gate's output
+                const size_t qb = n / 32 * 36;
+                uint8_t *xq = nullptr, *xqr = nullptr;
+                ck(cudaMalloc(&xq, qb), "malloc");
+                ck(cudaMalloc(&xqr, qb), "malloc");
+                ck(cudaMemset(xq, 0x5a, qb), "memset");
+                ck(cudaMemset(xqr, 0xa5, qb), "memset");
+                ck(cudaMemset(g_fused, 0, n * 4), "memset");
+                cudaStream_t qs = nullptr;
+                ck(cudaStreamCreate(&qs), "stream");
+                k::qsa_decode_attn_batch_merge_gate(d_steps, cap, s, scratch2, d_late, d_qf, g_fused, rows, qs, xq);
+                k::native_quantize_q8_1(g_ref, xqr, (int) (NH * HD), rows, qs);
+                ck(cudaStreamSynchronize(qs), "sync");
+                ck(cudaStreamDestroy(qs), "stream");
+                const std::vector<float> g2 = down(g_fused, n);
+                const std::vector<uint8_t> xa = down(xq, qb), xb = down(xqr, qb);
+                std::snprintf(nm, sizeof nm, "attn one merge + gate + q8_1, %d rows, %s", rows, int8 ? "int8" : "fp16");
+                report(nm, std::memcmp(g2.data(), gb.data(), n * 4) == 0 && std::memcmp(xa.data(), xb.data(), qb) == 0);
+                cudaFree(xq);
+                cudaFree(xqr);
             } else
                 std::printf("  attn merge + gate: declined (CUDA, or the v1 merge)\n");
             cudaFree(g_ref);
@@ -340,6 +361,30 @@ void gdn_case(const std::vector<int>& ntok, bool commit) {
     if (!commit) {
         const std::vector<float> a = down(d_y, (size_t) T * vd), b = down(d_yr, (size_t) T * vd);
         same = same && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        // STRATA_FUSE_GDNQ8: the same window with the outputs' q8_1 == native_quantize_q8_1 of the outputs
+        const size_t qb = (size_t) T * (vd / 32) * 36;   // block_q8_1: half2 ds + 32 int8
+        uint8_t *d_xq = nullptr, *d_xqr = nullptr;
+        float* d_y2 = nullptr;
+        ck(cudaMalloc(&d_xq, qb), "malloc");
+        ck(cudaMalloc(&d_xqr, qb), "malloc");
+        ck(cudaMalloc(&d_y2, (size_t) T * vd * 4), "malloc");
+        ck(cudaMemset(d_xq, 0x5a, qb), "memset");
+        ck(cudaMemset(d_xqr, 0xa5, qb), "memset");
+        cudaStream_t qs = nullptr;
+        ck(cudaStreamCreate(&qs), "stream");
+        k::gdn_step_norm_groups(gg, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_y2, h_k, h_v, false, qs, d_xq);
+        k::native_quantize_q8_1(d_yr, d_xqr, vd, T, qs);
+        ck(cudaStreamSynchronize(qs), "sync");
+        ck(cudaStreamDestroy(qs), "stream");
+        const std::vector<float> y2 = down(d_y2, (size_t) T * vd);
+        const std::vector<uint8_t> xa = down(d_xq, qb), xb = down(d_xqr, qb);
+        char qn[96], qr[64] = "";
+        for (int i = 0; i < G && i < 8; ++i) std::snprintf(qr + std::strlen(qr), sizeof qr - std::strlen(qr), "%s%d", i ? "," : "", ntok[i]);
+        std::snprintf(qn, sizeof qn, "gdn_step_norm_groups window + q8_1, groups of %s rows", qr);
+        report(qn, std::memcmp(y2.data(), b.data(), y2.size() * 4) == 0 && std::memcmp(xa.data(), xb.data(), qb) == 0);
+        cudaFree(d_xq);
+        cudaFree(d_xqr);
+        cudaFree(d_y2);
     }
     char name[96], rows[64] = "";
     for (int i = 0; i < G && i < 8; ++i) std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d", i ? "," : "", ntok[i]);

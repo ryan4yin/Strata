@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/q8_1_finite.hpp"   // fuse-gdn STRATA_FUSE_GATEMERGE_Q8: q8_1_ds
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/geometry.hpp"
@@ -832,22 +833,41 @@ __global__ void __launch_bounds__(HD) attn_merge_v2_kernel(const float* __restri
                                                                      scratch_stride);
 }
 
+// fuse-gdn (STRATA_FUSE_GATEMERGE_Q8): the q8_1 image of a 32-value block, written by the warp that holds it with
+// native_quantize_q8_1_kernel's quantizer - verify_kernels.cu's gdn_q8_1_store (the same XOR-tree max and sum,
+// no contraction of the product into the first sum)
+struct AttnQ81 { half2 ds; int8_t qs[32]; };
+__device__ __forceinline__ void attn_q8_1_store(AttnQ81* __restrict__ xq, size_t idx, float xi) {
+#pragma clang fp contract(off)
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    xq[idx / 32].qs[idx % 32] = q;
+    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);
+}
+
 // fuse-gdn (STRATA_FUSE_GATEMERGE): attn_merge_v2_kernel, then native_qsa_gate_apply's gate on the value it wrote -
-// q_full the query's q|gate rows (the gate half at + HD), gated[i] = attn[i] * (1 / (1 + expf(-raw))) as that kernel
-template <int U>
+// q_full the query's q|gate rows (the gate half at + HD), gated[i] = attn[i] * (1 / (1 + expf(-raw))) as that kernel;
+// Q8 (STRATA_FUSE_GATEMERGE_Q8): also gated's q8_1 image (native_quantize_q8_1 over the n_q rows)
+template <int U, bool Q8>
 __global__ void __launch_bounds__(HD) attn_merge_v2_gate_kernel(const float* __restrict__ part_acc,
                                                                 const float* __restrict__ part_m,
                                                                 const float* __restrict__ part_l, int n_chunks,
                                                                 const int32_t* __restrict__ steps,
                                                                 float* __restrict__ attn, long long scratch_stride,
                                                                 const float* __restrict__ q_full,
-                                                                float* __restrict__ gated) {
+                                                                float* __restrict__ gated, AttnQ81* __restrict__ xq) {
     const size_t i = ((size_t) blockIdx.y * gridDim.x + blockIdx.x) * HD + threadIdx.x;
     const float a = merge_v2_value<U>(part_acc, part_m, part_l, n_chunks, steps, scratch_stride);
     attn[i] = a;
     const float raw = q_full[((size_t) blockIdx.y * gridDim.x + blockIdx.x) * 2 * HD + HD + threadIdx.x];
     const float sigmoid = 1.0f / (1.0f + expf(-raw));
     gated[i] = a * sigmoid;
+    if constexpr (Q8) attn_q8_1_store(xq, i, a * sigmoid);
 }
 
 #if defined(STRATA_HIP_GFX906)
@@ -1149,7 +1169,8 @@ void qsa_decode_attn_batch_chunks(const float* q, const QsaAttnPools& pools, con
 }
 
 bool qsa_decode_attn_batch_merge_gate(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
-                                      float* attn, const float* q_full, float* gated, int64_t n_q, void* stream) {
+                                      float* attn, const float* q_full, float* gated, int64_t n_q, void* stream,
+                                      void* xq_out) {
     if (n_q <= 0) return true;
 #if defined(__HIPCC__)
     // HIP only: on CUDA native_qsa.cu (the gate) is built with --use_fast_math and this file is not
@@ -1164,8 +1185,13 @@ bool qsa_decode_attn_batch_merge_gate(const int32_t* steps, int64_t cap, const Q
     const float* part_acc = scratch;
     const float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     const float* part_l = part_m + (size_t) n_chunks * s.n_head;
-    attn_merge_v2_gate_kernel<kMergeU><<<dim3((unsigned) s.n_head, (unsigned) n_q), HD, 0, (cudaStream_t) stream>>>(
-        part_acc, part_m, part_l, n_chunks, steps, attn, stride, q_full, gated);
+    const dim3 grid((unsigned) s.n_head, (unsigned) n_q);
+    if (xq_out != nullptr)
+        attn_merge_v2_gate_kernel<kMergeU, true><<<grid, HD, 0, (cudaStream_t) stream>>>(
+            part_acc, part_m, part_l, n_chunks, steps, attn, stride, q_full, gated, static_cast<AttnQ81*>(xq_out));
+    else
+        attn_merge_v2_gate_kernel<kMergeU, false><<<grid, HD, 0, (cudaStream_t) stream>>>(
+            part_acc, part_m, part_l, n_chunks, steps, attn, stride, q_full, gated, nullptr);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch_merge_gate: %s\n", cudaGetErrorString(e));
@@ -1174,6 +1200,7 @@ bool qsa_decode_attn_batch_merge_gate(const int32_t* steps, int64_t cap, const Q
     return true;
 #else
     (void) steps; (void) cap; (void) s; (void) scratch; (void) attn; (void) q_full; (void) gated; (void) stream;
+    (void) xq_out;
     return false;
 #endif
 }
