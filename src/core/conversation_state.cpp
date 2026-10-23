@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/tail_prof.hpp"
 
 #include <algorithm>
 #include <array>
@@ -385,12 +386,14 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
 
 bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState& ss,
                                   const ModelGeometry& g, std::string& error) {
+    acommit_dbg().check(&ss, "conversation_checkpoint_save");
     bool staged = false;
     return checkpoint_save(c, ss, g, error, staged);
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
                                      const ModelGeometry& g, std::string& error) {
+    acommit_dbg().check(&ss, "conversation_checkpoint_restore");
     const VramSlot* hit = nullptr;
     if (c.dev_tag != 0) {
         int dev = 0;
@@ -430,6 +433,8 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
 
 bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, const std::vector<int32_t>& ids,
                                   const ModelGeometry& g, std::string& error, bool queued) {
+    acommit_dbg().check(&from, "conversation_checkpoint_copy (from)");
+    acommit_dbg().check(&to, "conversation_checkpoint_copy (to)");
     // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) without the host image, for two
     // sessions carved alike on the same device (a stage's own session and its batch slots): the same bytes into
     // the same places, through copy() like the restore (the private non-blocking stream, complete on return unless
@@ -520,6 +525,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* storage,
                                 std::vector<ConversationCheckpoint>* moved) {
+    acommit_dbg().check(&ss, "conversation_snapshot_save");
     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
