@@ -2,11 +2,12 @@
 //
 //     build/proj_bench [reps] [device]
 //
-// The groups of dense projections a verify window makes from one q8_1 input (GDN qkv + z, QSA k + v + q|gate), all
-// Q6_K, 1-4 columns (and a few edge shapes): A = the calls one by one (native_mmvq, STRATA_Q6K_V2 on), B = native_mmvq_proj.  Weights rotate
-// over enough copies to exceed the 64 MB Infinity Cache.  Two timings per path: the median of `reps` event-bracketed
-// groups, and a graph of 64 groups (the decode's form: no host launch in between) per group.  Every output of B is
-// compared bit for bit with A and with the calls on the V1 kernels (STRATA_Q6K_V2 off).  Exit code 1 on a difference.
+// The groups of dense projections a verify window makes from one q8_1 input (GDN qkv + z, QSA k + v + q|gate) at the
+// model's real quant-type mixes, 1-4 columns (and a few edge shapes): A = the calls one by one (native_mmvq,
+// STRATA_Q6K_V2 on), B = native_mmvq_proj.  Weights rotate over enough copies to exceed the 64 MB Infinity Cache.  Two
+// timings per path: the median of `reps` event-bracketed groups, and a graph of 64 groups (the decode's form: no host
+// launch in between) per group.  Every output of B is compared bit for bit with A and with the calls on the V1 kernels
+// (STRATA_Q6K_V2 off).  Exit code 1 on a difference.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -27,18 +28,38 @@ namespace {
 struct Group {
     const char* name;
     int n_in;
+    int type[4];
     int n_out[4];
     int n;
 };
+constexpr int Q4K = 12, Q5K = 13, Q6K = 14, IQ4XS = 23;
 const Group GROUPS[] = {
-    {"gdn qkv+z", 2560, {10240, 6144}, 2},
-    {"qsa k+v+q", 2560, {512, 512, 12288}, 3},
-    {"qsa k+v", 2560, {512, 512}, 2},
-    {"gdn out+out", 6144, {2560, 2560}, 2},
+    // GDN qkv + z: the model's seven type pairs (and the all-Q6_K one the Q6K_V2 body takes)
+    {"gdn qkv+z Q6Q6", 2560, {Q6K, Q6K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q5Q5", 2560, {Q5K, Q5K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q4Q4", 2560, {Q4K, Q4K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q6Q4", 2560, {Q6K, Q4K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q6IQ", 2560, {Q6K, IQ4XS}, {10240, 6144}, 2},
+    {"gdn qkv+z Q5Q6", 2560, {Q5K, Q6K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q6Q5", 2560, {Q6K, Q5K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q5IQ", 2560, {Q5K, IQ4XS}, {10240, 6144}, 2},
+    {"gdn qkv+z IQ6", 2560, {IQ4XS, Q6K}, {10240, 6144}, 2},
+    {"gdn qkv+z Q5Q4", 2560, {Q5K, Q4K}, {10240, 6144}, 2},
+    // QSA k + v + q: the small keys and values must ride with q (k + v alone loses 8-11 us).  These are the model's
+    // six triples: all-Q6_K plus (14,14,23), (14,14,13), (23,14,23), (14,13,12), (14,13,13).
+    {"qsa kvq Q6Q6Q6", 2560, {Q6K, Q6K, Q6K}, {512, 512, 12288}, 3},
+    {"qsa kvq Q6Q6IQ", 2560, {Q6K, Q6K, IQ4XS}, {512, 512, 12288}, 3},
+    {"qsa kvq Q6Q6Q5", 2560, {Q6K, Q6K, Q5K}, {512, 512, 12288}, 3},
+    {"qsa kvq IQ6IQ", 2560, {IQ4XS, Q6K, IQ4XS}, {512, 512, 12288}, 3},
+    {"qsa kvq Q6Q5Q4", 2560, {Q6K, Q5K, Q4K}, {512, 512, 12288}, 3},
+    {"qsa kvq Q6Q5Q5", 2560, {Q6K, Q5K, Q5K}, {512, 512, 12288}, 3},
+    // a mix no fixed kernel covers: the generic fallback, still bitwise
+    {"qsa kvq Q4Q4IQ", 2560, {Q4K, Q4K, IQ4XS}, {512, 512, 12288}, 3},
+    {"qsa k+v", 2560, {Q6K, Q6K}, {512, 512}, 2},
     // the edges: odd and one-row segments, a partial last iteration (1280, 3840: 5, 15 blocks a row), 4 segments
-    {"edge 1280", 1280, {63, 1, 513}, 3},
-    {"edge 3840", 3840, {5, 2048, 7, 301}, 4},
-    {"edge 1024", 1024, {1, 1}, 2},
+    {"edge 1280", 1280, {Q6K, Q4K, IQ4XS}, {63, 1, 513}, 3},
+    {"edge 3840", 3840, {Q4K, Q5K, Q6K, IQ4XS}, {5, 2048, 7, 301}, 4},
+    {"edge 1024", 1024, {Q5K, IQ4XS}, {1, 1}, 2},
 };
 
 bool ck(cudaError_t e, const char* what) {
@@ -61,11 +82,12 @@ struct Bufs {
 void run(const Group& g, const Bufs& b, int k, int T, bool fused, cudaStream_t s) {
     if (fused) {
         K::MmvqSeg sg[4];
-        for (int i = 0; i < g.n; ++i) sg[i] = {14, b.w[(size_t) i][(size_t) k], b.y[(size_t) i], g.n_out[i]};
+        for (int i = 0; i < g.n; ++i) sg[i] = {g.type[i], b.w[(size_t) i][(size_t) k], b.y[(size_t) i], g.n_out[i]};
         if (!K::native_mmvq_proj(sg, g.n, b.xq, g.n_in, T, s)) { std::printf("native_mmvq_proj did not take %s\n", g.name); std::exit(1); }
         return;
     }
-    for (int i = 0; i < g.n; ++i) K::native_mmvq(14, b.w[(size_t) i][(size_t) k], b.xq, b.y[(size_t) i], g.n_in, g.n_out[i], T, s);
+    for (int i = 0; i < g.n; ++i)
+        K::native_mmvq(g.type[i], b.w[(size_t) i][(size_t) k], b.xq, b.y[(size_t) i], g.n_in, g.n_out[i], T, s);
 }
 
 double median_us(const Group& g, const Bufs& b, int T, bool fused, int reps, cudaStream_t s, std::vector<cudaEvent_t>& ev) {
@@ -129,14 +151,21 @@ int main(int argc, char** argv) {
         std::mt19937 rng(91u + (unsigned) g.n_out[0] + (unsigned) g.n);
         Bufs b;
         size_t total = 0;
-        for (int i = 0; i < g.n; ++i) total += K::native_mmvq_weight_bytes(14, g.n_in, g.n_out[i]);
+        for (int i = 0; i < g.n; ++i) total += K::native_mmvq_weight_bytes(g.type[i], g.n_in, g.n_out[i]);
         b.copies = (int) std::max<size_t>(1, std::min<size_t>(8, (96u << 20) / total + 1));
         b.w.resize((size_t) g.n);
+        auto block_bytes = [](int type) { return type == Q4K ? 144 : type == Q5K ? 176 : type == Q6K ? 210 : 136; };
+        auto block_scale = [](int type) { return type == Q6K ? 208 : 0; };   // the fp16 d / dm's first half
+        auto block_scale_bytes = [](int type) { return type == Q4K || type == Q5K ? 4 : 2; };
         for (int i = 0; i < g.n; ++i) {
-            const size_t wb = K::native_mmvq_weight_bytes(14, g.n_in, g.n_out[i]);
+            const size_t wb = K::native_mmvq_weight_bytes(g.type[i], g.n_in, g.n_out[i]);
+            const int bb = block_bytes(g.type[i]), so = block_scale(g.type[i]);
             std::vector<uint8_t> w(wb);
             for (auto& v : w) v = (uint8_t) (rng() & 0xff);
-            for (size_t k = 0; k < wb / 210; ++k) { const uint16_t h = sane_half(rng); std::memcpy(&w[k * 210 + 208], &h, 2); }
+            for (size_t k = 0; k < wb / (size_t) bb; ++k) {
+                uint16_t h[2] = {sane_half(rng), sane_half(rng)};
+                std::memcpy(&w[k * (size_t) bb + (size_t) so], h, (size_t) block_scale_bytes(g.type[i]));
+            }
             for (int c = 0; c < b.copies; ++c) {
                 void* d = nullptr;
                 if (!ck(cudaMalloc(&d, wb), "malloc w") || !ck(cudaMemcpy(d, w.data(), wb, cudaMemcpyHostToDevice), "copy w")) return 1;
