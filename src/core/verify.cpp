@@ -382,6 +382,11 @@ bool fuse_rows_on() {
 
 // STRATA_FUSE_FETCH=1: the PCIe share's wait, fetch_blobs and rebase_ptrs in one launch (wait_fetch_rebase; the same
 // bytes, two kernel nodes fewer per layer and group).  Opt-in.
+// STRATA_FUSE_PLAN=1: with the device plan, the wait for the host's plan and its copy in one launch.  Opt-in.
+bool fuse_plan_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 bool fuse_fetch_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_FETCH"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
@@ -2445,7 +2450,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);
         } else {
-            if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+            if (device_plan_ && fuse_plan_on()) {   // STRATA_FUSE_PLAN: the two below in one launch
+                wait_copy_i32_from_mapped_unless(m_flagA_, ring, skip_ + grp, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_,
+                                                 plan_i32_, cs);
+            } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
             } else {

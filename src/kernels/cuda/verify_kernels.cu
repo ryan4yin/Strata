@@ -1619,6 +1619,21 @@ __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile
     if (*skip == value) return;
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
+// STRATA_FUSE_PLAN: wait_flag_ge_or_kernel then copy_i32_unless_kernel in one launch (nothing when *skip == value)
+__global__ void wait_copy_i32_unless_kernel(const volatile uint32_t* flag, uint32_t value, const volatile uint32_t* skip,
+                                            int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
+    __shared__ int s_skip;
+    if (threadIdx.x == 0) {
+        s_skip = *skip == value;
+        if (!s_skip) {
+            while (*flag < value) strata_spin_pause();
+            __threadfence_system();
+        }
+    }
+    __syncthreads();
+    if (s_skip) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
 __global__ void copy_or_zero_kernel(float4* __restrict__ dst, const volatile float4* src, long long n4,
                                     const uint32_t* skip, uint32_t value) {
     const bool zero = *skip == value;
@@ -1643,6 +1658,12 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
     if (n <= 0) return;
     copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n, skip, value);
     check("copy_i32_from_mapped_unless");
+}
+void wait_copy_i32_from_mapped_unless(const uint32_t* flag, uint32_t value, const uint32_t* skip, int32_t* dst,
+                                      const int32_t* src, long long n, void* stream) {
+    wait_copy_i32_unless_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, skip, dst, (const volatile int32_t*) src,
+                                                                     (int) (n > 0 ? n : 0));
+    check("wait_copy_i32_from_mapped_unless");
 }
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream) {
