@@ -149,8 +149,13 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
                  int n_in, int n_out, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
+/// STRATA_FUSE_SHPAIR=1: also Q4_K / Q5_K / Q6_K / IQ4_XS, 2-8 columns, where both calls would run b6_mmvq_rows_kernel
+/// or the exact native_mmvq_multi_kernel (not B7).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
+/// native_mmvq_pair with the K-quant / IQ4_XS pairs whatever STRATA_FUSE_SHPAIR says (the caller's own switch decides).
+bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                          int n_in, int n_out, int ncols, void* stream);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
