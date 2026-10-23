@@ -120,7 +120,14 @@ __global__ void norm_rope_kernel(const float* x, int in_stride, const float* __r
         asm volatile("mov.f32 %0, %1;" : "=f"(bc) : "f"(bc));
 #endif
         out_row[pair] = fmaf(a, c, -bs);
+#if defined(__HIP_DEVICE_COMPILE__)
+        // fuse-gdn: ROCm clang contracts apply's `a * s + b * c` as fma(b, c, a * s) (gfx1201 ISA: v_mul a*s, then
+        // v_fmac with c*b) - the same contraction here, so the pair is the apply kernel's bits (rope_parity check 6)
+        (void) bc;
+        out_row[pair + half_rot] = fmaf(b, c, a * s);
+#else
         out_row[pair + half_rot] = fmaf(a, s, bc);
+#endif
     }
 }
 }
