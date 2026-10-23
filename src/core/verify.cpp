@@ -478,6 +478,13 @@ bool fuse_nr3_on() {
     return on;
 }
 
+// fuse-gdn: STRATA_FUSE_GATEMERGE=1 (with STRATA_FUSE_ATTNMERGE=1, HIP) - the streamed per-row QSA path's late merge
+// also applies the output gate (qsa_decode_attn_batch_merge_gate), when no rotation comes between the two
+bool fuse_gatemerge_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_GATEMERGE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
 #if defined(STRATA_USE_HIP)
@@ -1998,6 +2005,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (!sidem) idx_query(cs);
                 }
                 stamp(l, 10, grp);
+                bool gate_done = false;   // STRATA_FUSE_GATEMERGE: the merge below wrote attn32_ too
                 bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
                 if (batch_rec_ && g_qsa_slots)
                     for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
@@ -2152,7 +2160,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
                                               attn_ + t * NH * HD, 1, cs);
                     }
-                    if (merge_late)   // every row's partials, written above, into its attention row
+                    if (merge_late && fuse_gatemerge_on() && qb && !st.kv_rot && !st.kv_hybrid)   // and the gate below
+                        gate_done = qsa_decode_attn_batch_merge_gate(step_ + tb * kStepCount, cap_, s,
+                                                                     attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                                     attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD,
+                                                                     attn32_ + tb * NH * HD, te - tb, cs);
+                    if (merge_late && !gate_done)   // every row's partials, written above, into its attention row
                         qsa_decode_attn_batch_merge(step_ + tb * kStepCount, cap_, s,
                                                     attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD,
                                                     te - tb, cs);
@@ -2183,7 +2196,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                if (gate_done) {
+                } else if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
                 for (int t = tb; t < te; ++t) {
