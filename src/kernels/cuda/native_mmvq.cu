@@ -1887,6 +1887,175 @@ bool b6_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, floa
     }
 }
 
+#if defined(__HIPCC__)
+// STRATA_FUSE_SHPAIR, gate and up of two formats: each half is one call's blocks as launch_multi_n would run them, at
+// block index bx - KIND 0 b6_mmvq_rows_kernel<F, NCOLS, 2>, KIND 1 native_mmvq_multi_kernel<F, NCOLS, WARPS, 2> (no
+// TSUM, no PDL prefetch on HIP).  The bodies are those kernels' bodies, copied (the kernels stay as they are).
+template<typename F, int NCOLS, int KIND> struct PairHalf;
+template<typename F, int NCOLS> struct PairHalf<F, NCOLS, 0> {
+    static constexpr int ROWS = 2;
+    __device__ __forceinline__ static void run(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                               float* __restrict__ y, int n_in, int n_out, int bx) {
+        using XB = B6X<F>;
+        const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+        const int row0 = ROWS * bx;
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        const int kqs = F::kqs(tid);
+        float tmp[NCOLS][ROWS] = {};
+        for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+            const int kby = kbx * F::KBY;
+            typename XB::X xv[NCOLS];
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) xv[j] = XB::xload(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const typename XB::W wv = XB::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
+                }
+            }
+        }
+        __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+        }
+        mmvq_sync_lds();
+        if (threadIdx.y > 0) return;
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+                tmp[j][i] = warp_sum(tmp[j][i]);
+                if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+            }
+        }
+    }
+};
+template<typename F, int NCOLS> struct PairHalf<F, NCOLS, 1> {
+    static constexpr int ROWS = 2, NW = WARPS;
+    static_assert(!kPdlPrefetch, "the copied body leaves out the PDL prefetch");
+    __device__ __forceinline__ static void run(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
+                                               int n_in, int n_out, int bx) {
+        const Q81Block* STRATA_PDL_RESTRICT x = x_;
+        float* STRATA_PDL_RESTRICT y = y_;
+        constexpr int BPI = F::BPI * NW / WARPS;
+        const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+        const int row0 = ROWS * bx;
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        float tmp[NCOLS][ROWS] = {};
+        int kbx = tid / F::T;
+        for (; kbx < blocks_per_row; kbx += BPI) {
+            const int kby = kbx * F::KBY;
+            const int kqs = F::kqs(tid);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                    const typename F::W wv = F::load(w + block, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)
+                        tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+        __shared__ float partial[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][WARP];
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+                for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+        }
+        mmvq_sync_lds();
+        if (threadIdx.y > 0) return;
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+                tmp[j][i] = warp_sum(tmp[j][i]);
+                if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+            }
+        }
+    }
+};
+// blocks [0, nb1): the first call's half, the rest the second's
+template<typename F1, typename F2, int NCOLS, int K1, int K2>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void mmvq_pair_mixed_kernel(const typename F1::Block* __restrict__ w1, const typename F2::Block* __restrict__ w2,
+                                       const Q81Block* __restrict__ x, float* __restrict__ y1, float* __restrict__ y2,
+                                       int n_in, int n_out, int nb1) {
+    const int bx = int(blockIdx.x);
+    if (bx < nb1) PairHalf<F1, NCOLS, K1>::run(w1, x, y1, n_in, n_out, bx);
+    else PairHalf<F2, NCOLS, K2>::run(w2, x, y2, n_in, n_out, bx - nb1);
+}
+// which half launch_multi_n would run for this call: 0 / 1 as PairHalf, -1 another kernel (B7, other rows, TSUM, ...)
+template<typename F, int NCOLS>
+int pair_kind(int n_in, int n_out) {
+    if (s26_tsum_on() || !g_multi_exact) return -1;
+    const int mode = b6_rows_mode();
+    if ((mode == 16 || (mode != 0 && b7_on())) && b7_takes<F, NCOLS>(n_in, n_out)) return -1;
+    if constexpr (B6X<F>::ok) {
+        int rows = 0;
+        if (!(mode == 0 || mode == 16 || n_in / F::DIV < 1)) {
+            if (mode < 0) {
+                if (dev_class() == 1) rows = b6_default_rows_gfx12<F, NCOLS>(n_out);
+            } else if (mode == 1) {
+                rows = 2;
+            } else {
+                rows = mode;
+            }
+        }
+        if (rows == 2) return 0;
+        if (rows > 0) return -1;
+    }
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) return -1;
+    return 1;
+}
+template<typename F1, typename F2, int NCOLS>
+bool mixed_pair_launch(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out,
+                       cudaStream_t s) {
+    const int k1 = pair_kind<F1, NCOLS>(n_in, n_out), k2 = pair_kind<F2, NCOLS>(n_in, n_out);
+    if (k1 < 0 || k2 < 0) return false;
+    const auto* a = static_cast<const typename F1::Block*>(w1);
+    const auto* b = static_cast<const typename F2::Block*>(w2);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int nb = (n_out + 1) / 2;   // both kinds: two rows a block
+    const dim3 grid(unsigned(2 * nb)), threads(WARP, WARPS);
+    if (k1 == 0 && k2 == 0) mmvq_pair_mixed_kernel<F1, F2, NCOLS, 0, 0><<<grid, threads, 0, s>>>(a, b, x, y1, y2, n_in, n_out, nb);
+    else if (k1 == 0) mmvq_pair_mixed_kernel<F1, F2, NCOLS, 0, 1><<<grid, threads, 0, s>>>(a, b, x, y1, y2, n_in, n_out, nb);
+    else if (k2 == 0) mmvq_pair_mixed_kernel<F1, F2, NCOLS, 1, 0><<<grid, threads, 0, s>>>(a, b, x, y1, y2, n_in, n_out, nb);
+    else mmvq_pair_mixed_kernel<F1, F2, NCOLS, 1, 1><<<grid, threads, 0, s>>>(a, b, x, y1, y2, n_in, n_out, nb);
+    return true;
+}
+template<typename F1, typename F2>
+bool mixed_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out, int ncols,
+                cudaStream_t s) {
+    switch (ncols) {
+        case 2: return mixed_pair_launch<F1, F2, 2>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 3: return mixed_pair_launch<F1, F2, 3>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 4: return mixed_pair_launch<F1, F2, 4>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 5: return mixed_pair_launch<F1, F2, 5>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 6: return mixed_pair_launch<F1, F2, 6>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 7: return mixed_pair_launch<F1, F2, 7>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        case 8: return mixed_pair_launch<F1, F2, 8>(w1, w2, x_q8_1, y1, y2, n_in, n_out, s);
+        default: return false;
+    }
+}
+#endif
+
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
@@ -3808,6 +3977,43 @@ bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const v
                           int n_in, int n_out, int ncols, void* stream) {
     if (ggml_type != 8) return mmvq_pair_kq(ggml_type, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
     return native_mmvq_pair(ggml_type, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+}
+
+bool native_mmvq_pair_mixed(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                            int n_in, int n_out, int ncols, void* stream) {
+#if defined(__HIPCC__)
+    if (!fuse_shpair_on() || type1 == type2) return false;
+    if (ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 256 != 0 || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+        return false;
+    {   // STRATA_Q6_PACKED tensors take their own kernel
+        const auto& reg = q6_packed_registry();
+        if (!reg.empty() && ((type1 == 14 && reg.count(w1)) || (type2 == 14 && reg.count(w2)))) return false;
+    }
+    auto rank = [](int t) { return t == 12 ? 0 : t == 13 ? 1 : t == 14 ? 2 : t == 23 ? 3 : -1; };
+    if (rank(type1) < 0 || rank(type2) < 0) return false;
+    if (rank(type1) > rank(type2)) {   // one kernel per unordered pair of formats: the halves are independent
+        std::swap(type1, type2);
+        std::swap(w1, w2);
+        std::swap(y1, y2);
+    }
+    const auto s = static_cast<cudaStream_t>(stream);
+    bool ran = false;
+    switch (type1 * 100 + type2) {
+        case 1213: ran = mixed_pair<Q4KTraits, Q5KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 1214: ran = mixed_pair<Q4KTraits, Q6KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 1223: ran = mixed_pair<Q4KTraits, IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 1314: ran = mixed_pair<Q5KTraits, Q6KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 1323: ran = mixed_pair<Q5KTraits, IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 1423: ran = mixed_pair<Q6KTraits, IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        default: return false;
+    }
+    if (ran) launch_check();
+    return ran;
+#else
+    (void) type1; (void) type2; (void) w1; (void) w2; (void) x_q8_1; (void) y1; (void) y2; (void) n_in; (void) n_out;
+    (void) ncols; (void) stream;
+    return false;
+#endif
 }
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,

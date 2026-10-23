@@ -283,6 +283,62 @@ int test_pair(std::mt19937& rng, cudaStream_t s) {
             }
         }
     }
+    // two formats (native_mmvq_pair_mixed, the switch on only): every ordered pair, the same checks
+    int mbad = 0, mcases = 0, mran = 0;
+    for (const auto& f1 : fmts) {
+        for (const auto& f2 : fmts) {
+            if (any || f1.type == f2.type) continue;
+            for (const int n_in : {2560, 1024}) {
+                for (const int n_out : {512, 640, 1537, 6144}) {
+                    auto make = [&](const Fmt& f) {
+                        const size_t wb = (size_t) (n_in / 256) * f.bytes * n_out;
+                        std::vector<uint8_t> w(wb);
+                        for (auto& b : w) b = (uint8_t) rng();
+                        for (size_t o = 0; o < wb; o += f.bytes)
+                            for (const int h : f.halves) {
+                                const uint16_t v = (uint16_t) ((rng() & 1 ? 0x8000 : 0) | ((3 + rng() % 7) << 10) | (rng() & 1023));
+                                std::memcpy(&w[o + h], &v, 2);
+                            }
+                        uint8_t* d = dev<uint8_t>(wb);
+                        up(d, w);
+                        return d;
+                    };
+                    uint8_t *d1 = make(f1), *d2 = make(f2);
+                    for (int nc = 2; nc <= 8; ++nc) {
+                        std::vector<float> x((size_t) nc * n_in);
+                        for (auto& v : x) v = nd(rng);
+                        float* dx = dev<float>(x.size());
+                        up(dx, x);
+                        uint8_t* xq = dev<uint8_t>((size_t) nc * (n_in / 32) * 36 + 256);
+                        native_quantize_q8_1(dx, xq, n_in, nc, s);
+                        const size_t no = (size_t) nc * n_out;
+                        float *a1 = dev<float>(no), *a2 = dev<float>(no), *b1 = dev<float>(no), *b2 = dev<float>(no);
+                        for (float* o : {a1, a2, b1, b2}) check(cudaMemset(o, 0x7f, no * 4), "memset");
+                        native_mmvq(f1.type, d1, xq, a1, n_in, n_out, nc, s);
+                        native_mmvq(f2.type, d2, xq, a2, n_in, n_out, nc, s);
+                        const bool r = native_mmvq_pair_mixed(f1.type, f2.type, d1, d2, xq, b1, b2, n_in, n_out, nc, s);
+                        check(cudaStreamSynchronize(s), "sync");
+                        ++mcases;
+                        mran += r;
+                        const auto ra = down(a1, no), rb = down(a2, no), ga = down(b1, no), gb = down(b2, no);
+                        std::vector<float> untouched(no);
+                        std::memset(untouched.data(), 0x7f, no * 4);
+                        if (r ? !(same(ra, ga) && same(rb, gb)) : !(same(ga, untouched) && same(gb, untouched))) {
+                            std::printf("    *** pair_mixed %s/%s %d x %d, %d columns, %s: differs ***\n", f1.name, f2.name, n_in,
+                                        n_out, nc, r ? "paired" : "declined");
+                            ++mbad;
+                        }
+                        cudaFree(dx); cudaFree(xq); cudaFree(a1); cudaFree(a2); cudaFree(b1); cudaFree(b2);
+                    }
+                    cudaFree(d1); cudaFree(d2);
+                }
+            }
+        }
+    }
+    if (!any)
+        std::printf("  %-60s %s (%d cases, %d paired)\n", "STRATA_FUSE_SHPAIR native_mmvq_pair_mixed == native_mmvq x 2",
+                    mbad || mran == 0 ? "*** NO ***" : "bitwise", mcases, mran);
+    bad += mbad + (!any && mran == 0);
     std::printf("  %-60s %s (%d cases, %d paired)\n", any ? "native_mmvq_pair_any == native_mmvq x 2"
                                                            : "STRATA_FUSE_SHPAIR native_mmvq_pair == native_mmvq x 2",
                 bad || ran == 0 ? "*** NO ***" : "bitwise", cases, ran);
