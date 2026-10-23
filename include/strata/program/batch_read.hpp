@@ -14,16 +14,24 @@ namespace strata::program {
 ///   beside_slots: some slot is decoding (its windows run between the pieces)
 ///   layer_split / piped: the read goes through a layer split's stages / the pipelined groups
 ///   chunks_per_piece: for a layer split with no slot decoding, the pieces' length in chunks (0: one run)
+///   piece_tokens: optional cap for a one-GPU read beside decoding slots (STRATA_BATCH_PIECE_TOKENS;
+///                 0 keeps the pre-change behavior: one prompt chunk per piece). This only applies while
+///                 another slot is decoding, so a solo cold read still uses the whole prompt chunk.
 /// A layer split reads its stages as a pipeline over one run's chunks, so a piece costs a pipeline fill; with slots
 /// decoding the pieces are single chunks anyway.  With no slot decoding a piece is `chunks_per_piece` chunks: long
 /// enough to keep the pipeline full, short enough that a BYIELD is taken within a few chunks (it used to wait for the
 /// whole prompt, and the long prompt then held its slot: "ERR BGEN: no such free slot" for the request that should
 /// have taken over).
 inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool beside_slots, int64_t chunk,
-                                int64_t chunks_per_piece) {
+                                int64_t chunks_per_piece, int64_t piece_tokens = 0) {
     if (!batch || piped) return 0;
     chunk = std::max<int64_t>(chunk, 1);
-    if (!layer_split || beside_slots) return chunk;
+    if (!layer_split || beside_slots) {
+        // One GPU, slots decoding: a smaller piece lets their windows run more often. With no slot decoding
+        // (a solo cold prompt) the whole prompt chunk is still read in one run; this is the point of the cap.
+        if (beside_slots && piece_tokens > 0) return std::min(chunk, piece_tokens);
+        return chunk;
+    }
     return chunks_per_piece > 0 ? chunk * chunks_per_piece : 0;
 }
 

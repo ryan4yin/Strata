@@ -14121,6 +14121,13 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_PIPED_READ_PIECE");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
                 }();
+                // STRATA_BATCH_PIECE_TOKENS (off by default): the one-GPU --batch prompt read is capped to this
+                // many tokens per piece while another slot decodes, so an existing stream is not stopped for the
+                // whole prompt. A solo cold read (no slot decoding) keeps the full prompt chunk.
+                static const int64_t batch_piece_tokens = [] {
+                    const char* v = std::getenv("STRATA_BATCH_PIECE_TOKENS");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+                }();
                 static const double pr_cap = [] {
                     const char* v = std::getenv("STRATA_PIPED_DECODE_MAX_MS");
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
@@ -14133,7 +14140,7 @@ int main(int argc, char** argv) {
                 auto piece_now = [&]() -> int64_t {
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
                                  : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
-                                                                     yield_chunks);
+                                                                     yield_chunks, batch_piece_tokens);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
                 auto piped_decode = [&](double budget_ms, std::string& err) -> bool {

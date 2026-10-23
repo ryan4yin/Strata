@@ -24,6 +24,13 @@ int main() {
     CHECK(batch_read_piece(true, false, false, true, 2048, 8) == 2048);
     // layer split with slots decoding: a chunk per piece as before
     CHECK(batch_read_piece(true, false, true, true, 2048, 8) == 2048);
+    // STRATA_BATCH_PIECE_TOKENS: the cap applies only while a slot decodes
+    CHECK(batch_read_piece(true, false, false, true, 2048, 8, 640) == 640);
+    CHECK(batch_read_piece(true, false, true, true, 2048, 8, 768) == 768);
+    CHECK(batch_read_piece(true, false, false, false, 2048, 8, 640) == 2048);
+    CHECK(batch_read_piece(true, false, true, false, 2048, 8, 640) == 8 * 2048);
+    CHECK(batch_read_piece(true, false, false, true, 512, 8, 640) == 512);
+    CHECK(batch_read_piece(true, false, false, true, 2048, 8, 0) == 2048);
     // layer split, nobody decoding: pieces of 8 chunks - the BYIELD of a shorter request can be taken (it was one run)
     CHECK(batch_read_piece(true, false, true, false, 2048, 8) == 8 * 2048);
     CHECK(batch_read_piece(true, false, true, false, 1024, 4) == 4096);
