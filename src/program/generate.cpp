@@ -1,4 +1,3 @@
-#include "strata/core/tail_prof.hpp"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -19,6 +18,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/core/tail_prof.hpp"
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
@@ -11558,6 +11558,8 @@ int main(int argc, char** argv) {
         static const bool ple_pf = [] { const char* v = std::getenv("STRATA_FUSE_PLEPF"); return v != nullptr && std::atoi(v) != 0; }();
         // STRATA_FUSE_DRAFTHEAD=1: the two slots' MTP rounds with the draft head read once (run_pending)
         static const bool draft_head = [] { const char* v = std::getenv("STRATA_FUSE_DRAFTHEAD"); return v != nullptr && std::atoi(v) != 0; }();
+        // STRATA_FUSE_DRAFTEARLY=1 (with DRAFTHEAD): the pair's drafts launched before the commit (early_pair)
+        static const bool draft_early = [] { const char* v = std::getenv("STRATA_FUSE_DRAFTEARLY"); return v != nullptr && std::atoi(v) != 0; }();
         long long tp_long = 0;   // STRATA_DBG_TAIL: main-loop gaps past 5 ms (a request's prompt read)
         auto batch_step = [&]() -> bool {
             strata::core::TailProf& tp = strata::core::tail_prof();   // STRATA_DBG_TAIL
@@ -11656,22 +11658,6 @@ int main(int argc, char** argv) {
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
-            const Clock::time_point tp_c0 = Clock::now();
-            if (tpo) { tp.add(tp.kRunTotal, w0, w1); tp.add(tp.kPreCommit, w1, tp_c0); }
-            if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
-                std::printf("ERR %s\n", err.c_str());
-                return false;
-            }
-            const Clock::time_point w2 = Clock::now();
-            auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
-            bt_run += msd(w0, w1);
-            bt_commit += msd(w1, w2);
-            if (tpo) tp.add(tp.kCommitTotal, tp_c0, w2);
-            ++bt_windows;
-            for (int a = 0; a < A; ++a) {
-                bt_rows += keep[active[a]];
-                bt_accepted += keep[active[a]] - 1;
-            }
             // slot t's draft (the copy of its two residual rows, then its drafter's round)
             auto run_draft = [&](int t) -> bool {
                 const int b = active[t];
@@ -11697,75 +11683,160 @@ int main(int argc, char** argv) {
             // STRATA_FUSE_DRAFTHEAD: two slots' rounds on the lower slot's drafter's stream, to their head inputs, then
             // one pair graph (the head read once for both rows, each slot's select), one sync; else each slot's draft()
             int pend[strata::kernels::kVerifyMaxT] = {}, n_pend = 0;
-            auto run_pending = [&]() -> bool {
-                int t0 = pend[0], t1 = n_pend > 1 ? pend[1] : -1;
-                if (t1 >= 0 && active[t1] < active[t0]) std::swap(t0, t1);
-                strata::core::MtpDrafter* O = n_pend == 2 ? slot_mtp[(size_t) active[t0]].get() : nullptr;
-                strata::core::MtpDrafter* P = n_pend == 2 ? slot_mtp[(size_t) active[t1]].get() : nullptr;
-                const int b0 = active[t0], b1 = n_pend == 2 ? active[t1] : -1;
-                const bool pair = n_pend == 2 && O->pair_with(*P) &&
-                                  O->pair_ok(2, pos[first[t0]], keep[b0] - 1, 0.0f, nullptr) &&
-                                  P->pair_ok(2, pos[first[t1]], keep[b1] - 1, 0.0f, nullptr);
-                if (!pair) {
+            struct PairRun {
+                bool on = false;
+                int tt[2] = {-1, -1};
+                strata::core::MtpDrafter* D[2] = {};
+                cudaStream_t s0 = nullptr;
+            } pr;
+            // 1: slots t0 and t1 launched as a pair (pr), 0: not a pair (nothing launched), -1: an error
+            auto pair_launch = [&](int t0, int t1) -> int {
+                if (active[t1] < active[t0]) std::swap(t0, t1);
+                strata::core::MtpDrafter* O = slot_mtp[(size_t) active[t0]].get();
+                strata::core::MtpDrafter* P = slot_mtp[(size_t) active[t1]].get();
+                if (!(O->pair_with(*P) && O->pair_ok(2, pos[first[t0]], keep[active[t0]] - 1, 0.0f, nullptr) &&
+                      P->pair_ok(2, pos[first[t1]], keep[active[t1]] - 1, 0.0f, nullptr))) {
                     static int said = 0;
-                    if (n_pend == 2 && said++ < 2)
+                    if (said++ < 2)
                         std::fprintf(stderr, "strata batch: STRATA_FUSE_DRAFTHEAD declined: pair_with %d, pair_ok %d %d\n",
-                                     (int) O->pair_with(*P), (int) O->pair_ok(2, pos[first[t0]], keep[b0] - 1, 0.0f, nullptr),
-                                     (int) P->pair_ok(2, pos[first[t1]], keep[b1] - 1, 0.0f, nullptr));
-                    for (int k = 0; k < n_pend; ++k) if (!run_draft(pend[k])) return false;
-                    return true;
+                                     (int) O->pair_with(*P), (int) O->pair_ok(2, pos[first[t0]], keep[active[t0]] - 1, 0.0f, nullptr),
+                                     (int) P->pair_ok(2, pos[first[t1]], keep[active[t1]] - 1, 0.0f, nullptr));
+                    return 0;
                 }
                 const strata::core::OnDevice on_mtp(O->device());
-                cudaStream_t s0 = O->stream();
+                pr.s0 = O->stream();
+                pr.tt[0] = t0;
+                pr.tt[1] = t1;
+                pr.D[0] = O;
+                pr.D[1] = P;
                 const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                const int tt[2] = {t0, t1};
-                strata::core::MtpDrafter* const D[2] = {O, P};
                 for (int r = 0; r < 2; ++r) {
-                    const int b = active[tt[r]];
-                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), ver.final_R_all() + (size_t) first[tt[r]] * stride,
-                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice, s0) != cudaSuccess ||
-                        !D[r]->draft_pair_launch(*O, r, 2, outb + first[tt[r]], pos[first[tt[r]]], keep[b] - 1, s0, err)) {
+                    const int b = active[pr.tt[r]];
+                    if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), ver.final_R_all() + (size_t) first[pr.tt[r]] * stride,
+                                        2 * stride * sizeof(float), cudaMemcpyDeviceToDevice, pr.s0) != cudaSuccess ||
+                        !pr.D[r]->draft_pair_launch(*O, r, 2, outb + first[pr.tt[r]], pos[first[pr.tt[r]]], keep[b] - 1,
+                                                    pr.s0, err)) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                        return -1;
+                    }
+                }
+                if (!O->pair_head_launch(*P, pr.s0, err)) {
+                    std::printf("ERR batch MTP slots %d+%d: %s\n", active[t0], active[t1], err.c_str());
+                    return -1;
+                }
+                pr.on = true;
+                ++tp.pair_rounds;
+                return 1;
+            };
+            // after the pair's sync: each slot's draft (STRATA_DBG_DRAFTCHECK: against its own draft() again)
+            auto pair_finish = [&]() -> bool {
+                {
+                    const strata::core::OnDevice on_mtp(pr.D[0]->device());
+                    if (cudaStreamSynchronize(pr.s0) != cudaSuccess) {
+                        std::printf("ERR batch MTP slots %d+%d: the pair's sync\n", active[pr.tt[0]], active[pr.tt[1]]);
                         return false;
                     }
                 }
-                if (!O->pair_head_launch(*P, s0, err) || cudaStreamSynchronize(s0) != cudaSuccess) {
-                    std::printf("ERR batch MTP slots %d+%d: %s\n", b0, b1, err.empty() ? "the pair's sync" : err.c_str());
-                    return false;
-                }
-                ++tp.pair_rounds;
+                pr.on = false;
                 static const bool dcheck = [] { const char* v = std::getenv("STRATA_DBG_DRAFTCHECK"); return v != nullptr && v[0] == '1'; }();
                 std::vector<float> lg[2];
                 int32_t dr[2] = {};
                 for (int r = 0; r < 2; ++r) {
-                    BSlot& sl = bs[(size_t) active[tt[r]]];
-                    D[r]->draft_pair_finish(sl.draft.data());
+                    BSlot& sl = bs[(size_t) active[pr.tt[r]]];
+                    pr.D[r]->draft_pair_finish(sl.draft.data());
                     dr[r] = sl.draft[0];
                     if (dcheck) {   // (both rows before a rerun: the owner's rerun writes its row 0)
-                        lg[r].resize((size_t) O->head_vocab());
-                        cudaMemcpy(lg[r].data(), O->head_logits_row(r), lg[r].size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        lg[r].resize((size_t) pr.D[0]->head_vocab());
+                        cudaMemcpy(lg[r].data(), pr.D[0]->head_logits_row(r), lg[r].size() * sizeof(float), cudaMemcpyDeviceToHost);
                     }
                 }
                 for (int r = 0; r < 2; ++r) {
-                    BSlot& sl = bs[(size_t) active[tt[r]]];
+                    const int t = pr.tt[r];
+                    BSlot& sl = bs[(size_t) active[t]];
+                    if (!sl.active) continue;   // (DRAFTEARLY mispredicted: counted where its lines ended it)
                     if (dcheck) {   // STRATA_DBG_DRAFTCHECK: the slot's own draft() again (same inputs, same K/V cells)
-                        if (!run_draft(tt[r])) return false;
-                        std::vector<float> ref((size_t) D[r]->head_vocab());
-                        cudaMemcpy(ref.data(), D[r]->head_logits_row(0), ref.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                        if (!run_draft(t)) return false;
+                        std::vector<float> ref((size_t) pr.D[r]->head_vocab());
+                        cudaMemcpy(ref.data(), pr.D[r]->head_logits_row(0), ref.size() * sizeof(float), cudaMemcpyDeviceToHost);
                         ++tp.draft_checked;
                         if (sl.draft[0] != dr[r] || std::memcmp(ref.data(), lg[r].data(), ref.size() * sizeof(float)) != 0) {
                             ++tp.draft_bad;
                             if (tp.draft_bad <= 4)
                                 std::fprintf(stderr, "strata batch: DRAFTCHECK slot %d differs: pair %d, draft() %d\n",
-                                             active[tt[r]], dr[r], sl.draft[0]);
+                                             active[t], dr[r], sl.draft[0]);
                         }
                         continue;
                     }
                     sl.draft_ready = true;
-                    if (ple_pf) (void) ver.ple_prefetch_slot(active[tt[r]], sl.x, sl.draft[0]);
+                    if (ple_pf) (void) ver.ple_prefetch_slot(active[t], sl.x, sl.draft[0]);
                 }
                 return true;
             };
+            auto run_pending = [&]() -> bool {
+                if (n_pend == 2) {
+                    const int r = pair_launch(pend[0], pend[1]);
+                    if (r < 0) return false;
+                    if (r == 1) return pair_finish();
+                }
+                for (int k = 0; k < n_pend; ++k) if (!run_draft(pend[k])) return false;
+                return true;
+            };
+            // STRATA_FUSE_DRAFTEARLY: slot t goes on past this window's lines (the BT loop's own tests, before it runs)
+            auto goes_on = [&](int t) -> bool {
+                const int b = active[t];
+                const BSlot& sl = bs[(size_t) b];
+                if (!sl.active) return false;
+                for (int r = first[t]; r < first[t] + 2; ++r) if (ver.nonfinite_in(r)) return false;
+                for (int j = 0; j < keep[b]; ++j) {
+                    const int32_t y = outb[first[t] + j];
+                    if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end() || sl.stop ||
+                        sl.produced + j + 1 >= sl.max_new || sl.p + j + 2 > o.max_context)
+                        return false;
+                }
+                return true;
+            };
+            auto early_pair = [&]() -> bool {
+                if (!(draft_head && draft_early && batch_mtp && stages.empty())) return true;
+                int eg[2] = {-1, -1}, n = 0;
+                for (int t = 0; t < A; ++t)
+                    if (goes_on(t)) { if (n < 2) eg[n] = t; ++n; }
+                if (n != 2) return true;
+                const int r = pair_launch(eg[0], eg[1]);
+                if (r < 0) return false;
+                if (r == 0) return true;
+                static cudaEvent_t ev = nullptr;
+                const strata::core::OnDevice on_mtp(pr.D[0]->device());
+                if (ev == nullptr && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                    std::printf("ERR batch MTP: the early drafts' event\n");
+                    return false;
+                }
+                if (cudaEventRecord(ev, pr.s0) != cudaSuccess) {
+                    std::printf("ERR batch MTP: the early drafts' event\n");
+                    return false;
+                }
+                ver.set_commit_after(ev);
+                ++tp.early_rounds;
+                return true;
+            };
+            // STRATA_FUSE_DRAFTEARLY=1: the two slots that go on (as the BT lines below will find) draft before the
+            // commit, which waits for them on its stream: the window's commit and drafts in one host sync
+            if (!early_pair()) return false;
+            const Clock::time_point tp_c0 = Clock::now();
+            if (tpo) { tp.add(tp.kRunTotal, w0, w1); tp.add(tp.kPreCommit, w1, tp_c0); }
+            if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
+            const Clock::time_point w2 = Clock::now();
+            auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+            bt_run += msd(w0, w1);
+            bt_commit += msd(w1, w2);
+            if (tpo) tp.add(tp.kCommitTotal, tp_c0, w2);
+            ++bt_windows;
+            for (int a = 0; a < A; ++a) {
+                bt_rows += keep[active[a]];
+                bt_accepted += keep[active[a]] - 1;
+            }
             for (int t = 0; t < A; ++t) {
                 const Clock::time_point tp_e0 = Clock::now();
                 if (ple_pf && batch_mtp && t == 0)   // row 0 of every slot that goes on: its last kept pick
@@ -11811,15 +11882,21 @@ int main(int argc, char** argv) {
                 }
                 const Clock::time_point tp_d0 = Clock::now();
                 if (tpo) tp.add(tp.kEmitPrint, tp_e0, tp_d0);
-                if (batch_mtp && sl.active) {
+                if (pr.on && (t == pr.tt[0] || t == pr.tt[1])) {   // drafted before the commit
+                    if (!sl.active) {
+                        ++tp.early_bad;
+                        std::fprintf(stderr, "strata batch: DRAFTEARLY drafted slot %d, which ended\n", b);
+                    }
+                } else if (batch_mtp && sl.active) {
                     if (draft_head) pend[n_pend++] = t;   // STRATA_FUSE_DRAFTHEAD: after every slot's lines
                     else if (!run_draft(t)) return false;
                 }
                 if (tpo) tp.add(tp.kDraftTotal, tp_d0, Clock::now());
             }
-            if (n_pend > 0) {
+            if (pr.on || n_pend > 0) {
                 const Clock::time_point tp_d0 = Clock::now();
-                if (!run_pending()) return false;
+                if (pr.on && !pair_finish()) return false;
+                if (n_pend > 0 && !run_pending()) return false;
                 if (tpo) tp.add(tp.kDraftTotal, tp_d0, Clock::now());
             }
             const Clock::time_point tp_f0 = Clock::now();
@@ -11893,13 +11970,13 @@ int main(int argc, char** argv) {
                                          "pre-commit %.3f + commit %.3f [launch call %.3f, sync %.3f] + BT lines %.3f + "
                                          "copy+draft %.3f [prep %.3f, launch calls %.3f, wait %.3f] + fflush %.3f + adapt "
                                          "%.3f + report %.3f; run prep: pre_launch %.3f, checks+refresh_ar %.3f, graphs %.3f, "
-                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld, checked %lld, %lld differ\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
+                                         "records %.3f, PLE gather %.3f; PLE check %lld rows, %lld differ; pair drafts %lld (early %lld, ended %lld), checked %lld, %lld differ\n", (long long) tp.windows, M(tp.kLoop), (long long) tp_long,
                                  M(tp.kPlan), M(tp.kRunTotal), M(tp.kRunPrep), M(tp.kRunLaunch), M(tp.kPreCommit),
                                  M(tp.kCommitTotal), M(tp.kCommitLaunch), M(tp.kCommitSync), M(tp.kEmitPrint),
                                  M(tp.kDraftTotal), M(tp.kDraftPrep), M(tp.kDraftLaunch), M(tp.kDraftWait), M(tp.kFlush),
                                  M(tp.kAdapt), M(tp.kReport), M(tp.kRunPreLaunch), M(tp.kSbRefresh), M(tp.kSbCapture),
                                  M(tp.kSbRecords), M(tp.kSbPle), tp.ple_checked, tp.ple_bad,
-                                 tp.pair_rounds, tp.draft_checked, tp.draft_bad);
+                                 tp.pair_rounds, tp.early_rounds, tp.early_bad, tp.draft_checked, tp.draft_bad);
                     tp = strata::core::TailProf{};
                     tp_long = 0;
                 }
