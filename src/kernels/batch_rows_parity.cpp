@@ -18,11 +18,14 @@
 //      each row its own pools, page table (non-resident pages) and host copy.
 //   8. STRATA_FUSE_NR3: native_qsa_rms_norm_rope_segs (K in place, the query out of its q|gate rows, the indexer
 //      query in place) == the three native_qsa_rms_norm_rope calls.
+//   9. STRATA_FUSE_IDXPAIR: bf16_gemv_fp32_mmvf_multi_pair == the two bf16_gemv_fp32_mmvf_multi calls (run it with
+//      STRATA_MMVF_ROWS=1, else the pair declines).
 // Every case compares with memcmp, not a tolerance. Usage: batch_rows_parity
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -767,6 +770,40 @@ void nr3_case(int n) {
     report(name, eq(k_ref, k_seg, (size_t) n * NKV * HD) && eq(q_ref, q_seg, (size_t) n * NH * HD) &&
                      eq(i_ref, i_seg, (size_t) n * IQ * ID));
 }
+// ---- 9. two bf16 projections of the same rows in one launch (STRATA_FUSE_IDXPAIR) ----
+void idxpair_case(int n_in, int n_tok) {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int o1 = (int) s.idx_dim, o2 = (int) (s.idx_n_head * s.idx_dim);
+    std::mt19937 rng(97 + n_in + n_tok);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) n_tok * n_in);
+    for (auto& v : x) v = nd(rng);
+    auto wgt = [&](int rows) {
+        std::vector<uint16_t> w((size_t) rows * n_in);
+        for (auto& v : w) { const float f = nd(rng) * 0.05f; uint32_t b; std::memcpy(&b, &f, 4); v = (uint16_t) (b >> 16); }
+        return w;
+    };
+    const float* d_x = up(x);
+    const uint16_t *d_w1 = up(wgt(o1)), *d_w2 = up(wgt(o2));
+    float *a1 = up(std::vector<float>((size_t) n_tok * o1, 0.f)), *a2 = up(std::vector<float>((size_t) n_tok * o2, 0.f));
+    float *b1 = up(std::vector<float>((size_t) n_tok * o1, 0.f)), *b2 = up(std::vector<float>((size_t) n_tok * o2, 0.f));
+    cudaStream_t st = nullptr;
+    ck(cudaStreamCreate(&st), "stream");
+    k::bf16_gemv_fp32_mmvf_multi(d_x, n_in, d_w1, a1, o1, n_in, o1, n_tok, st);
+    k::bf16_gemv_fp32_mmvf_multi(d_x, n_in, d_w2, a2, o2, n_in, o2, n_tok, st);
+    const bool ran = k::bf16_gemv_fp32_mmvf_multi_pair(d_x, n_in, d_w1, b1, o1, o1, d_w2, b2, o2, o2, n_in, n_tok, st);
+    ck(cudaStreamSynchronize(st), "sync");
+    ck(cudaStreamDestroy(st), "stream");
+    char name[96];
+    if (!ran) {
+        std::printf("  bf16 pair, n_in %d, %d rows: declined (STRATA_MMVF_ROWS=1 not set, or STRATA_TSUM=1)\n", n_in, n_tok);
+        return;
+    }
+    const std::vector<float> x1 = down(a1, (size_t) n_tok * o1), y1 = down(b1, (size_t) n_tok * o1);
+    const std::vector<float> x2 = down(a2, (size_t) n_tok * o2), y2 = down(b2, (size_t) n_tok * o2);
+    std::snprintf(name, sizeof name, "bf16 pair (%d + %d outputs), n_in %d, %d rows", o1, o2, n_in, n_tok);
+    report(name, std::memcmp(x1.data(), y1.data(), x1.size() * 4) == 0 && std::memcmp(x2.data(), y2.data(), x2.size() * 4) == 0);
+}
 }  // namespace
 
 int main() {
@@ -814,6 +851,8 @@ int main() {
     for (const bool mirror : {false, true})
         for (int r : {1, 2, 4, 8}) kvrows_case(r, mirror);
     for (int r : {1, 3, 8}) nr3_case(r);
+    for (int ni : {2048, 4096})
+        for (int r : {2, 3, 4, 8}) idxpair_case(ni, r);
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;
 }
