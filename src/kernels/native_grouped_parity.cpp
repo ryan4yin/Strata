@@ -583,7 +583,7 @@ int main(int argc, char** argv) {
     for (int gu : {16, 17, 18, 21, 22})
         for (int dt : {20, 42}) check_sw_gu(gu, dt, 2560, 640, s, rng);
     // STRATA_EXPDEC_V2: its gate/up formats under the IQ4_NL down (and Q2_0's: the V2 gate/up alone), the largest codes
-    for (int gu : {22, 18})
+    for (int gu : {22, 18, 21})
         for (const bool extreme : {false, true}) {
             check_v2(gu, 20, 2560, 640, extreme, s, rng);
             if (!extreme) check_v2(gu, 42, 2560, 640, false, s, rng);
