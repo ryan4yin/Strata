@@ -508,6 +508,14 @@ bool fuse_routebell_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ROUTEBELL"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_FUSE_SHBEL=1 (with STRATA_FUSE_ROUTEBELL): the shared expert's gate/up pair (native_mmvq_pair's one launch)
+// also rides in that top-10 + doorbell launch (native_mmvq_pair_router_bell): block 0 routes and fires the bell, the
+// pair's blocks follow and never wait for it.  The q8_1 image of x must exist before the router, so this path quantizes
+// it there (the same bytes the old path made inside shared_expert_multi).  Opt-in, default off.
+bool fuse_shbel_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHBEL"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 // STRATA_FUSE_SHGATE=1 (with STRATA_FUSE_COMBINE, outside the all-resident path): the shared expert's gate row rides in
 // the router's GEMV launch (bf16_gemv_fp32_mmvf_multi_aux) and its sigmoid + row scale in that combine
 // (native_moe_combine_multi_hits_mapped's shared_gate), as STRATA_LFUSE does on the all-resident path: two kernel nodes
@@ -2470,6 +2478,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_sgi = (lfuse_on(n) && g_lfuse_gate()) || shgate_on(n, tb) ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
         const float route_prior = g_route_prior();
+        // STRATA_VERIFY_QDEDUP: the experts' q8_1 image of xm is made first and the shared expert's gate/up read it
+        // (quantize_q8_1_rows and native_quantize_q8_1 write the same bytes).  STRATA_FUSE_SHBEL needs that image before
+        // the router, so the same flag is decided here and the one quantization is moved up when it fuses.
+        bool qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
+        bool qdedup_ready = false;
         // STRATA_FUSE_ROUTEBELL: the doorbell below rides in the top-10's launch where nothing runs between them
         bool bell_done = false;
         bool bell_fuse = fuse_routebell_on() && !ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
@@ -2477,6 +2490,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #if defined(STRATA_USE_HIP)
         bell_fuse = bell_fuse && !g_doorbell_store;
 #endif
+        // STRATA_FUSE_SHBEL: the shared expert's gate/up pair's weights and its q8_1 input, for the fused router launch
+        const WeightRef* w_sg_pair = v.get("ffn_gate_shexp.weight");
+        const WeightRef* w_su_pair = v.get("ffn_up_shexp.weight");
+        const auto pair_type_ok = [](const WeightRef* w) {
+            return w != nullptr && w->native_data != nullptr &&
+                   (w->native_type == 12 || w->native_type == 13 || w->native_type == 14 || w->native_type == 23);
+        };
+        const bool sh_pair_path = (lfuse_on(n) && g_lfuse_pair()) || fuse_shpair_on();
+        const bool shbel_candidate = fuse_shbel_on() && bell_fuse && sh_pair_path && pair_type_ok(w_sg_pair) &&
+                                     pair_type_ok(w_su_pair) && n >= 2 && n <= 8 && N % 256 == 0 && g.n_ff % 2 == 0 &&
+                                     (!sh_fork || sh_fork_late);
+        bool sh_pair_fused = false;
+        const void* sh_pair_xq = nullptr;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -2486,7 +2512,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
-                if (bell_fuse)
+                if (shbel_candidate) {   // the q8_1 image has to exist before the launch that also reads it
+                    if (q8_ffn) {
+                        sh_pair_xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                    } else if (qdedup) {
+                        quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                        sh_pair_xq = nat_xq_ + (size_t) tb * (N / 32) * 36;
+                        qdedup_ready = true;
+                    } else {
+                        void* q8 = sh_fork ? (void*) sh_xq_ : (void*) xq_;
+                        native_quantize_q8_1(xm, q8, (int) N, n, cs);
+                        sh_pair_xq = q8;
+                    }
+                    sh_pair_fused = native_mmvq_pair_router_bell(
+                        w_sg_pair->native_type, w_su_pair->native_type, w_sg_pair->native_data, w_su_pair->native_data,
+                        sh_pair_xq, sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff, (int) N, (int) g.n_ff, n,
+                        logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
+                        hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr, (int) g.n_expert,
+                        (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                    if (sh_pair_fused) bell_done = true;
+                }
+                if (bell_fuse && !bell_done)
                     bell_done = native_router_top10_multi_bell(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm,
                                                                hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr,
                                                                (int) g.n_expert, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
@@ -2558,7 +2604,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         stamp(l, 17, grp);
-        bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
                             *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
@@ -2571,11 +2616,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
-            // STRATA_VERIFY_QDEDUP=1 (not with the forked shared-expert stream, which quantizes into its own buffer): the
-            // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
-            // native_quantize_q8_1 write the same bytes)
-            qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
-            if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            // STRATA_VERIFY_QDEDUP (see above): the experts' q8_1 image of xm is made first; STRATA_FUSE_SHBEL already
+            // made it before the router, so the one quantization is not repeated.
+            if (qdedup && !q8_ffn && !qdedup_ready) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -2583,8 +2626,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
-                                    qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | ((lfuse_on(n) && g_lfuse_pair()) || fuse_shpair_on() ? 2 : 0));
+                                    sh_pair_xq != nullptr
+                                        ? sh_pair_xq
+                                        : (qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr),
+                                    (sg_ready ? 1 : 0) | (sh_pair_path ? 2 : 0) | (sh_pair_fused ? 4 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();

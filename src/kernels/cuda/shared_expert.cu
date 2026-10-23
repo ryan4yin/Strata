@@ -216,6 +216,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
     const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
+    // STRATA_FUSE_SHBEL: the gate/up pair already ran in the router's launch (native_mmvq_pair_router_bell); only
+    // the SwiGLU, its q8_1 and the down projection are left here.  The pair's output bytes are that launch's.
+    const bool pair_done = (lfuse & 4) != 0;
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
@@ -227,7 +230,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     }
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
     // (STRATA_FUSE_SHPAIR: gate and up of two formats too, native_mmvq_pair_mixed)
-    if (!(pair && (nw.gate_type == nw.up_type
+    if (!pair_done && !(pair && (nw.gate_type == nw.up_type
                        ? native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff,
                                           n_tok, stream)
                        : native_mmvq_pair_mixed(nw.gate_type, nw.up_type, nw.gate_data, nw.up_data, x_q8_1, gate, up,

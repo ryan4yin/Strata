@@ -41,6 +41,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -2223,6 +2224,167 @@ bool mixed_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, f
         default: return false;
     }
 }
+void launch_check();
+// ---- STRATA_FUSE_SHBEL: the shared expert's gate/up pair and the window's top-10 + doorbell in one launch.
+// The same split as STRATA_FUSE_PROJ: block 0 is a prefix (the router), then the pair's blocks in segment order.  The
+// router body is route_multi_bell's (native_router.cu), copied with four warps and one token per warp per pass, so up
+// to eight tokens still fit; the pair blocks are exactly PairHalf's bodies.  Nothing in block 0 waits for the pair:
+// the bell rises as soon as the top-10 is written, while the other blocks are still reading their weights.
+__device__ __forceinline__ float route_warp_max(float value) {
+#pragma unroll
+    for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
+    return value;
+}
+__device__ __forceinline__ void pair_route_bell_block(const float* __restrict__ logits_, int32_t* __restrict__ ids_,
+                                                      float* __restrict__ weights_, int n_tok, const float* __restrict__ x,
+                                                      const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                                                      float* x_out, int32_t* ids_out, uint32_t* seq) {
+    const int lane = (int) threadIdx.x;
+    for (int tk = (int) threadIdx.y; tk < n_tok; tk += WARPS) {
+        const float* __restrict__ logits = logits_ + (size_t) tk * 512;
+        int32_t* ids = ids_ + (size_t) tk * 10;
+        float* __restrict__ weights = weights_ + (size_t) tk * 10;
+        float values[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+        __syncwarp();
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+        maximum = route_warp_max(maximum);
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] = expf(values[i] - maximum);
+            sum += values[i];
+        }
+        const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] *= reciprocal;
+            if (__isnanf(values[i])) values[i] = -FLT_MAX;
+        }
+        float selected = 0.0f, selected_sum = 0.0f;
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = values[0];
+            int expert = lane;
+#pragma unroll
+            for (int i = 1; i < 16; ++i) {
+                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            if ((expert & 31) == lane) {
+                values[expert / 32] = -INFINITY;
+                ids[rank] = expert;
+                selected_sum += best;
+            }
+            if (rank == lane) selected = best;
+        }
+        selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+        const float inverse_selected_sum = 1.0f / selected_sum;
+        if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    }
+    __syncthreads();
+    const int t = (int) threadIdx.y * WARP + lane;
+    int any_miss = 0;
+    if (t < k) {
+        const int32_t id = ids_[t];
+        ids_out[t] = id;
+        if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+    }
+    if (__syncthreads_or(any_miss)) {
+        for (int i = t; i < n; i += WARPS * WARP) x_out[i] = x[i];
+        __threadfence_system();
+    } else if (t < k) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (t == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)  // #697 (as doorbell_publish_res_kernel)
+        __threadfence_system();
+#endif
+    }
+}
+
+// block 0: the router + bell; blocks [1, 1 + 2 * nb): the pair's first half then its second
+template<typename F1, typename F2, int NCOLS, int K1, int K2>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void pair_router_bell_kernel(const typename F1::Block* __restrict__ w1,
+                                        const typename F2::Block* __restrict__ w2, const Q81Block* __restrict__ x,
+                                        float* __restrict__ y1, float* __restrict__ y2, int n_in, int n_out, int nb1,
+                                        const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                        float* __restrict__ weights, int n_tok, const float* __restrict__ r_x,
+                                        const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                                        float* x_out, int32_t* ids_out, uint32_t* seq) {
+    if (blockIdx.x == 0) {
+        pair_route_bell_block(logits, ids, weights, n_tok, r_x, d_res, n_expert, n, k, x_out, ids_out, seq);
+        return;
+    }
+    const int bx = int(blockIdx.x) - 1;
+    if (bx < nb1) PairHalf<F1, NCOLS, K1>::run(w1, x, y1, n_in, n_out, bx);
+    else PairHalf<F2, NCOLS, K2>::run(w2, x, y2, n_in, n_out, bx - nb1);
+}
+
+template<typename F1, typename F2, int NCOLS>
+bool pair_router_bell_n(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out,
+                        const float* logits, int32_t* ids, float* weights, int n_tok, const float* r_x,
+                        const int32_t* d_res, int n_expert, int64_t n, int64_t k, float* x_out, int32_t* ids_out,
+                        uint32_t* seq, cudaStream_t s) {
+    const int k1 = pair_kind<F1, NCOLS>(n_in, n_out), k2 = pair_kind<F2, NCOLS>(n_in, n_out);
+    if (k1 < 0 || k2 < 0) return false;
+    const auto* a = static_cast<const typename F1::Block*>(w1);
+    const auto* b = static_cast<const typename F2::Block*>(w2);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int nb = (n_out + 1) / 2;
+    const dim3 grid(unsigned(1 + 2 * nb)), threads(WARP, WARPS);
+    const auto launch = [&](auto kern) {
+        kern<<<grid, threads, 0, s>>>(a, b, x, y1, y2, n_in, n_out, nb, logits, ids, weights, n_tok, r_x, d_res, n_expert,
+                                      (int) n, (int) k, x_out, ids_out, seq);
+    };
+    if (k1 == 0 && k2 == 0) launch(pair_router_bell_kernel<F1, F2, NCOLS, 0, 0>);
+    else if (k1 == 0) launch(pair_router_bell_kernel<F1, F2, NCOLS, 0, 1>);
+    else if (k2 == 0) launch(pair_router_bell_kernel<F1, F2, NCOLS, 1, 0>);
+    else launch(pair_router_bell_kernel<F1, F2, NCOLS, 1, 1>);
+    launch_check();
+    return true;
+}
+template<typename F1, typename F2>
+bool pair_router_bell_any_ncols(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in,
+                                int n_out, int ncols, const float* logits, int32_t* ids, float* weights, int n_tok,
+                                const float* r_x, const int32_t* d_res, int n_expert, int64_t n, int64_t k, float* x_out,
+                                int32_t* ids_out, uint32_t* seq, cudaStream_t s) {
+    switch (ncols) {
+        case 2: return pair_router_bell_n<F1, F2, 2>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 3: return pair_router_bell_n<F1, F2, 3>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 4: return pair_router_bell_n<F1, F2, 4>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 5: return pair_router_bell_n<F1, F2, 5>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 6: return pair_router_bell_n<F1, F2, 6>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 7: return pair_router_bell_n<F1, F2, 7>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        case 8: return pair_router_bell_n<F1, F2, 8>(w1, w2, x_q8_1, y1, y2, n_in, n_out, logits, ids, weights, n_tok,
+                                                    r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+        default: return false;
+    }
+}
+template<typename F1, typename F2>
+bool pair_router_bell_dispatch(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in,
+                               int n_out, int ncols, const float* logits, int32_t* ids, float* weights, int n_tok,
+                               const float* r_x, const int32_t* d_res, int n_expert, int64_t n, int64_t k, float* x_out,
+                               int32_t* ids_out, uint32_t* seq, cudaStream_t s) {
+    return pair_router_bell_any_ncols<F1, F2>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, logits, ids, weights, n_tok,
+                                               r_x, d_res, n_expert, n, k, x_out, ids_out, seq, s);
+}
 #endif
 
 template<typename F, int NCOLS>
@@ -4247,6 +4409,54 @@ bool native_mmvq_pair_mixed(int type1, int type2, const void* w1, const void* w2
 #else
     (void) type1; (void) type2; (void) w1; (void) w2; (void) x_q8_1; (void) y1; (void) y2; (void) n_in; (void) n_out;
     (void) ncols; (void) stream;
+    return false;
+#endif
+}
+
+bool native_mmvq_pair_router_bell(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1,
+                                  float* y1, float* y2, int n_in, int n_out, int ncols, const float* logits,
+                                  int32_t* ids, float* weights, int n_tok, const float* x, const int32_t* d_res,
+                                  int n_expert, int64_t n, int64_t k, float* x_out, int32_t* ids_out, uint32_t* seq,
+                                  void* stream) {
+#if defined(__HIPCC__)
+    if            (ncols < 2 || ncols > 8 || n_out <= 0 || (n_out & 1) != 0 || n_in <= 0 || n_in % 256 != 0 ||
+                   !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !logits || !ids || !weights || !x || !ids_out || !seq ||
+                   !stream || n_tok < 1 || n_tok > 8 || k != (int64_t) n_tok * 10 || n < 0 || n > (int64_t) 1 << 30 ||
+                   n_expert <= 0)
+        return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto go = [&](auto f1, auto f2) {
+        return pair_router_bell_dispatch<decltype(f1), decltype(f2)>(
+            w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, logits, ids, weights, n_tok, x, d_res, n_expert, n, k, x_out,
+            ids_out, seq, s);
+    };
+    if (type1 == type2) {
+        if (type1 == 12) return go(Q4KTraits{}, Q4KTraits{});
+        if (type1 == 13) return go(Q5KTraits{}, Q5KTraits{});
+        if (type1 == 14) return go(Q6KTraits{}, Q6KTraits{});
+        if (type1 == 23) return go(IQ4XSTraits{}, IQ4XSTraits{});
+        return false;
+    }
+    auto rank = [](int t) { return t == 12 ? 0 : t == 13 ? 1 : t == 14 ? 2 : t == 23 ? 3 : -1; };
+    if (rank(type1) < 0 || rank(type2) < 0) return false;
+    if (rank(type1) > rank(type2)) {   // one kernel per unordered pair of formats: the halves are independent
+        std::swap(type1, type2);
+        std::swap(w1, w2);
+        std::swap(y1, y2);
+    }
+    switch (type1 * 100 + type2) {
+        case 1213: return go(Q4KTraits{}, Q5KTraits{});
+        case 1214: return go(Q4KTraits{}, Q6KTraits{});
+        case 1223: return go(Q4KTraits{}, IQ4XSTraits{});
+        case 1314: return go(Q5KTraits{}, Q6KTraits{});
+        case 1323: return go(Q5KTraits{}, IQ4XSTraits{});
+        case 1423: return go(Q6KTraits{}, IQ4XSTraits{});
+        default: return false;
+    }
+#else
+    (void) type1; (void) type2; (void) w1; (void) w2; (void) x_q8_1; (void) y1; (void) y2; (void) n_in; (void) n_out;
+    (void) ncols; (void) logits; (void) ids; (void) weights; (void) n_tok; (void) x; (void) d_res; (void) n_expert;
+    (void) n; (void) k; (void) x_out; (void) ids_out; (void) seq; (void) stream;
     return false;
 #endif
 }
