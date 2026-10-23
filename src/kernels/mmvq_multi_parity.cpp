@@ -85,6 +85,8 @@ bool ck(cudaError_t e, const char* what) {
     return false;
 }
 
+int g_v2_multi = -1;   // >= 0: native_mmvq_set_q6k_v2 for the T-column call only (the single-column calls: V1)
+
 // Returns the number of outputs that differ bit for bit; counts the non-finite outputs and the differences on
 // outputs that are finite in both paths.
 long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, long long& diff_finite, bool& ran) {
@@ -144,7 +146,9 @@ long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, lo
     if (!ck(cudaStreamSynchronize(s), "quantize")) return -1;
 
     try {
+        if (g_v2_multi >= 0) strata::kernels::native_mmvq_set_q6k_v2(g_v2_multi);
         strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
+        if (g_v2_multi >= 0) strata::kernels::native_mmvq_set_q6k_v2(0);
         for (int j = 0; j < T; ++j)
             strata::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + (std::size_t) j * qcol,
                                          dsingle + (std::size_t) j * c.n_out, c.n_in, c.n_out, 1, s);
@@ -221,8 +225,7 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 }  // namespace
 
 // STRATA_Q6K_V2: Q6_K at the model's shapes and the kernel's edges (1 iteration with idle warps, a partial last
-// iteration, an odd row count, 6 iterations) and the extremes, 2-4 columns against single-column calls (the V1
-// kernels), with B6 on its gfx12 table and off (the exact rows kernel)
+// iteration, an odd row count, 6 iterations) and the extremes, 1-4 columns (V2) against single-column calls (V1), with B6 on its gfx12 table and off (the exact rows kernel)
 const Case V2_CASES[] = {
     {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},
     {"Q6_K 512x63", 14, 512, 63, 256, 210, {208, -1}},
@@ -242,11 +245,12 @@ int sweep_v2(cudaStream_t s, Totals& t) {
         strata::kernels::native_mmvq_set_b6_rows(b6);
         std::printf("\n=== STRATA_Q6K_V2, B6 rows mode %d ===\n", b6);
         for (const Case& c : V2_CASES) {
-            for (int T = 2; T <= 4; ++T) {
+            for (int T = 1; T <= 4; ++T) {
                 long long nf = 0, dfin = 0;
                 bool ran = false;
-                strata::kernels::native_mmvq_set_q6k_v2(1);
-                const long long diff = compare(c, T, s, nf, dfin, ran);   // (single-column calls: V1)
+                g_v2_multi = 1;
+                const long long diff = compare(c, T, s, nf, dfin, ran);
+                g_v2_multi = -1;
                 strata::kernels::native_mmvq_set_q6k_v2(-1);
                 if (!ran) { ++bad; continue; }
                 t.checked += (long long) T * c.n_out;
