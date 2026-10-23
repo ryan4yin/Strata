@@ -2233,17 +2233,14 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
 // of reading what swiglu_q8_1_entries_kernel wrote.  Value i = (entry, column) is that kernel's: the same SwiGLU
 // expression with contraction off (the product rounded on its own), then q8_1_store's block (the same XOR-tree max and
 // sum over the 32 lanes of the block, d, the quantized value and ds).  A warp makes one block; 256 threads, 8 warps.
-// sw_q8_1_value: lane's h and its block's q / ds (the whole warp calls it, one q8_1 block of 32 consecutive values)
-__device__ __forceinline__ void sw_q8_1_value(const float* __restrict__ gate, const float* __restrict__ up, long long i,
-                                              int8_t& q, half2& ds) {
+// sw_q8_1_value: lane's h = SwiGLU(g, u) and its block's q / ds (the whole warp calls it, one q8_1 block of 32
+// consecutive values)
+__device__ __forceinline__ void sw_q8_1_value(const float g, const float u, int8_t& q, half2& ds) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
-#endif
-    const float g = gate[i];
-#if defined(__HIPCC__)
-    const float xi = (g / (1.0f + __expf(-g))) * up[i];
+    const float xi = (g / (1.0f + __expf(-g))) * u;
 #else
-    const float xi = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+    const float xi = __fmul_rn(g / (1.0f + __expf(-g)), u);
 #endif
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -2255,37 +2252,54 @@ __device__ __forceinline__ void sw_q8_1_value(const float* __restrict__ gate, co
     q = q8_1_quant(xi, d, amax);
     ds = q8_1_ds(d, sum);
 }
-// n entries from e (HB = n_ff / 32 blocks each) as raw q8_1 blocks: s_hq[c * HB + k], what native_down_multi_kernel's
-// staging copied from hq + e * HB
+// The blocks idx = warp, warp + 8, ... < nblk (at most NI per warp) of the n entries from e (HB = n_ff / 32 blocks
+// each): every gate / up load of the warp is issued before the first block's reduction, then put(idx, lane, q, ds)
+template<int HB, int NI, typename Put>
+__device__ __forceinline__ void sw_stage(const float* __restrict__ gate, const float* __restrict__ up, int e, int nblk,
+                                         int tid, Put put) {
+    const int warp = tid >> 5, lane = tid & 31;
+    float gv[NI], uv[NI];
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int idx = warp + 8 * j;
+        if (idx < nblk) {
+            const long long i = (long long) e * (HB * 32) + (long long) idx * 32 + lane;   // entry c = idx / HB, block idx % HB
+            gv[j] = gate[i];
+            uv[j] = up[i];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+        const int idx = warp + 8 * j;
+        if (idx < nblk) {   // warp-uniform
+            int8_t q;
+            half2 ds;
+            sw_q8_1_value(gv[j], uv[j], q, ds);
+            put(idx, lane, q, ds);
+        }
+    }
+}
+// n entries from e as raw q8_1 blocks: s_hq[c * HB + k], what native_down_multi_kernel's staging copied from hq + e * HB
 template<int HB>
 __device__ __forceinline__ void sw_stage_blocks(block_q8_1* s_hq, const float* __restrict__ gate, const float* __restrict__ up,
                                                 int e, int n, int tid) {
-    const int warp = tid >> 5, lane = tid & 31;
-    for (int idx = warp; idx < n * HB; idx += 8) {
-        const int c = idx / HB, k = idx - c * HB;
-        int8_t q;
-        half2 ds;
-        sw_q8_1_value(gate, up, (long long) (e + c) * (HB * 32) + k * 32 + lane, q, ds);
+    sw_stage<HB, (GRP_NC * HB + 7) / 8>(gate, up, e, n * HB, tid, [&](int idx, int lane, int8_t q, half2 ds) {
         s_hq[idx].qs[lane] = q;
         if (lane == 0) s_hq[idx].ds = ds;
-    }
+    });
 }
 // the same for expdec_down_kernel's layout (ed_stage_entry<XB, HALVES> of each entry): the quantized bytes in their
 // planes of s_u and s_ds[c XB + k] = __low2float(ds)
-template<int XB, bool HALVES>
+template<int XB, bool HALVES, int NC>
 __device__ __forceinline__ void sw_stage_ed(int4* s_u, float* s_ds, const float* __restrict__ gate, const float* __restrict__ up,
                                             int e, int n, int tid) {
-    const int warp = tid >> 5, lane = tid & 31;
     int8_t* b = reinterpret_cast<int8_t*>(s_u);
-    for (int idx = warp; idx < n * XB; idx += 8) {
+    sw_stage<XB, (NC * XB + 7) / 8>(gate, up, e, n * XB, tid, [&](int idx, int lane, int8_t q, half2 ds) {
         const int c = idx / XB, k = idx - c * XB;
-        int8_t q;
-        half2 ds;
-        sw_q8_1_value(gate, up, (long long) (e + c) * (XB * 32) + k * 32 + lane, q, ds);
         if constexpr (HALVES) b[((c * 2 + (lane >> 4)) * XB + k) * 16 + (lane & 15)] = q;
         else b[(c * XB + k) * 32 + lane] = q;
-        if (lane == 0) s_ds[c * XB + k] = __low2float(ds);
-    }
+        if (lane == 0) s_ds[idx] = __low2float(ds);
+    });
 }
 
 // native_down_kernel with the entries taken GRP_NC at a time.  SW (STRATA_FUSE_SWIGLU_DOWN; the IQ4_NL / NVFP4 8-lane
@@ -2850,7 +2864,7 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
         for (int e = e0; e < e1; e += ED_NC) {
             const int n = min(ED_NC, e1 - e);
             if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
-            if constexpr (SW) sw_stage_ed<ED_HB, TD == 42>(s_u, s_ds, sw_gate, sw_up, e, n, tid);
+            if constexpr (SW) sw_stage_ed<ED_HB, TD == 42, ED_NC>(s_u, s_ds, sw_gate, sw_up, e, n, tid);
             else
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, TD == 42>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
             iq_sync_lds();
@@ -6506,7 +6520,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #if STRATA_EXP_LAYOUTS
     const bool sw_down = false;
 #else
+    // Only in a call launched for a few groups (grid_groups 1..4: the verify window's PCIe call): every down block
+    // makes the h of its group's entries again, and over a VRAM call's groups that costs more than the launch saves
+    // (native_grouped_parity --bench, R9700, 28 groups / 40 entries: IQ4_NL down 138 -> 167 us, Q2_0 117 -> 123 us;
+    // no group: 8.0 -> 5.7 us, one group of 2: 18.8 -> 17.7 us).
     const bool sw_down = !gs_done && !v1 && L.had_block == 0 && g_exp_phase == 0 && fuse_sw_down_on() &&
+                         grid_groups > 0 && grid_groups <= 4 &&
                          (expdec_down_takes(L) ||
                           (L.d_type == 20 && L.n_ff == 640 && !g_old_kernels && !split_off<20>() && !g_no_sub16_gu));
 #endif
