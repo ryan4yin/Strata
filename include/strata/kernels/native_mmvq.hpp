@@ -37,6 +37,9 @@ bool native_mmvq_multi_exact();
 // Supported specializations include Q4_K, Q5_K, Q6_K, IQ4_XS, IQ4_NL and Q8_0. Set before graph capture.
 void native_mmvq_set_b6_rows(int mode);
 int native_mmvq_b6_rows();
+// STRATA_Q6K_V2=1 (AMD): Q6_K's 2-4 column calls where B6 or the exact rows kernel would run, by a kernel issuing all
+// of a thread's loads first; every output bitwise the same.  -1 = the environment's.  Set before graph capture.
+void native_mmvq_set_q6k_v2(int on);
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does
