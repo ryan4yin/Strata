@@ -2364,7 +2364,7 @@ __device__ __forceinline__ auto tok_sel(const GrMulti& m, int k, F f) {
 }
 
 // INJ: the inject block (rg == Q8_RG), a separate path so no branch joins its loads with the weight rows'
-template <int T, int R, bool INJ>
+template <int T, int R, bool INJ, bool JT>
 __device__ __forceinline__ void gr_down_q8_v2_body(const GrMulti& m, float* __restrict__ part, float* __restrict__ ssg,
                                                    float (&xs)[T][Q8_KC], float (&red)[WARPS][T]) {
     constexpr int P = pow2_ceil(T), NR = INJ ? 1 : R;
@@ -2474,7 +2474,14 @@ __device__ __forceinline__ void gr_down_q8_v2_body(const GrMulti& m, float* __re
             }
         }
     }
-    {   // the NR x P sums at once, one a lane (tsum<NR P>: bitwise the per-row warp sums)
+    if (!JT) {   // a row at a time
+#pragma unroll
+        for (int r = 0; r < NR; ++r) {
+            const int prow = INJ ? LR + warp : (rg * WARPS + warp) * R + r;
+            const float v = tsum<P>(acc[r], lane);
+            if (owner) part[((size_t) tk * Q8_NKC + kc) * PR + prow] = v;
+        }
+    } else {   // the NR x P sums at once, one a lane (tsum<NR P>: bitwise the per-row warp sums)
         const float v = tsum<NR * P>(&acc[0][0], lane);
         const int j = tsum_token<NR * P>(lane), r = j / P, k = j - r * P;
         const int prow = INJ ? LR + warp : (rg * WARPS + warp) * R + r;
@@ -2482,13 +2489,13 @@ __device__ __forceinline__ void gr_down_q8_v2_body(const GrMulti& m, float* __re
     }
 }
 // R rows a warp: LR / (8 R) row-group blocks + the inject block, a column chunk each
-template <int T, int R>
+template <int T, int R, bool JT>
 __global__ void __launch_bounds__(THREADS) gr_down_q8_v2_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
     static_assert(LR % (WARPS * R) == 0, "geometry");
     __shared__ __align__(16) float xs[T][Q8_KC];
     __shared__ float red[WARPS][T];
-    if (blockIdx.x == LR / (WARPS * R)) gr_down_q8_v2_body<T, R, true>(m, part, ssg, xs, red);
-    else gr_down_q8_v2_body<T, R, false>(m, part, ssg, xs, red);
+    if (blockIdx.x == LR / (WARPS * R)) gr_down_q8_v2_body<T, R, true, JT>(m, part, ssg, xs, red);
+    else gr_down_q8_v2_body<T, R, false, JT>(m, part, ssg, xs, red);
 }
 
 template <int T>
@@ -2649,7 +2656,8 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
 #if !STRATA_GR_FAST_BUILD
     const int v2 = ts ? gr_q8_v2() : 0;   // STRATA_GR_Q8_V2 (bitwise the tsum kernels)
-    if (v2) gr_down_q8_v2_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    if (v2)   // (the joint warp sum measured slower at T = 4..6)
+        gr_down_q8_v2_kernel<T, 4, (T <= 3 || T >= 7)><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else
 #endif
     if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
