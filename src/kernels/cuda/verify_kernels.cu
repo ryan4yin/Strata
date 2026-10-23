@@ -779,6 +779,45 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     check("fetch_blobs");
 }
 
+namespace {
+// STRATA_FUSE_FETCH: wait_flag_ge(_or)_kernel + fetch_blobs_kernel + rebase_ptrs_kernel.  A block with no blob word to
+// copy has nothing to wait for, except block 0 (the launch must not end before the flag: the grouped call after it
+// reads the staging and the PCIe share's rows).  The pointers go to their own array: rebasing `src` in place could
+// overwrite a pointer another block has yet to read.
+__global__ void wait_fetch_rebase_kernel(const volatile uint32_t* flag, uint32_t value, const uint32_t* skip,
+                                         const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                         uint4* __restrict__ dst, long long per, unsigned long long* __restrict__ ptr_out,
+                                         unsigned long long base, long long bytes) {
+    const int nb = *n;
+    const long long total = (long long) nb * per;
+    if (blockIdx.x == 0 || (long long) blockIdx.x * blockDim.x < total) {   // uniform over the block
+        if (threadIdx.x == 0 && !(skip != nullptr && *(const volatile uint32_t*) skip == value)) {
+            while (*flag < value) strata_spin_pause();
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+    if (blockIdx.x == 0 && threadIdx.x < 128 && (int) threadIdx.x < nb)   // rebase_ptrs_kernel's 128 threads
+        ptr_out[threadIdx.x] = base + (unsigned long long) threadIdx.x * (unsigned long long) bytes;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long) gridDim.x * blockDim.x) {
+        const long long k = i / per, off = i - k * per;
+        dst[i] = ((const uint4*) src[k])[off];
+    }
+}
+}  // namespace
+
+void wait_fetch_rebase(const uint32_t* flag, uint32_t value, const uint32_t* skip, const unsigned long long* src,
+                       const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, unsigned long long* ptr_out,
+                       void* stream) {
+    if (cap <= 0) return;
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "wait_fetch_rebase: blob size must be a multiple of 16\n"); std::exit(1); }
+    wait_fetch_rebase_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>((const volatile uint32_t*) flag, value, skip, src, n,
+                                                                       (uint4*) dst, (long long) (blob_bytes / 16), ptr_out,
+                                                                       (unsigned long long) dst, (long long) blob_bytes);
+    check("wait_fetch_rebase");
+}
+
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
     if (n <= 0) return;
     res_patch_kernel<<<(n + 255) / 256 < 64 ? (n + 255) / 256 : 64, 256, 0, (cudaStream_t) stream>>>(table, pairs, n);

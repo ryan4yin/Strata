@@ -472,6 +472,22 @@ bool fuse_rows_on() {
 #endif
 }
 
+// STRATA_FUSE_FETCH=1: the PCIe share's wait, fetch_blobs and rebase_ptrs in one launch (wait_fetch_rebase; the same
+// bytes, two kernel nodes fewer per layer and group).  Opt-in.
+bool fuse_fetch_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_FETCH"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// STRATA_FUSE_COMBINE=1: the CPU share's wait and copy (copy_rows_from_mapped_after, or with the device plan
+// wait_flag_ge_or + copy_or_zero_from_mapped) folded into the hits-added combine, which reads the pool's mapped rows
+// itself (native_moe_combine_multi_hits_mapped; the same values, one or two kernel nodes fewer per layer and group).
+// Opt-in.
+bool fuse_combine_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_COMBINE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
 bool fuse_convab_on() {
 #if defined(STRATA_USE_HIP)
@@ -1045,6 +1061,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        staged_ptr_ = fuse_fetch_on() ? b.take<unsigned long long>(kStagingBlobs) : nullptr;   // last: the rest as before
     };
     Bump count;
     carve(count);
@@ -2370,6 +2387,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        bool fuse_comb = false;   // STRATA_FUSE_COMBINE took effect: the combine reads the CPU's mapped rows itself
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
@@ -2392,6 +2410,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
+            // STRATA_FUSE_FETCH: the wait, the copy and the pointers in one launch; the pointers into staged_ptr_
+            const bool fuse_fetch = sink_.pcie_mode == 2 && staged_ptr_ != nullptr && m_bal_ == nullptr && !prof_on_;
+            const unsigned long long* p_ptr2_use = p_ptr2;
+            if (fuse_fetch) {
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                unsigned long long* sp = staged_ptr_ + grp * per;
+                wait_fetch_rebase(m_flagB_, ring, device_plan_ ? skip_ + grp : nullptr, p_ptr2, p_counts + 2, stage,
+                                  (int64_t) lay.blob_bytes(l), (int) per, sp, cs);
+                p_ptr2_use = sp;
+            } else {
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
                 wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
@@ -2402,11 +2431,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
             }
+            }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
+            grouped(p_ptr2_use, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
+            // STRATA_FUSE_COMBINE: the hits-added combine below waits for the CPU's rows and reads them where they are
+            fuse_comb = fuse_combine_on() && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch &&
+                        n > 1 && n <= 8 && native_moe_combine_enabled() && m_bal_ == nullptr &&
+                        (device_plan_ || fuse_rows_on()) &&
+                        native_moe_combine_hits_supported(m_ymiss_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+            if (fuse_comb) {
+                stamp(l, 23, grp);
+                hits_in_combine = true;
+            } else
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
@@ -2432,6 +2471,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
+            if (!fuse_comb)
             hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
                               native_moe_combine_enabled() && n <= 8 &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
@@ -2445,6 +2485,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (fuse_comb) {
+            try {
+                native_moe_combine_multi_hits_mapped(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                                                     shared_ + tb * N, bo_ + tb * N, N, K, n, m_flag_, ring,
+                                                     device_plan_ ? skip_ + grp : nullptr, nullptr, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {

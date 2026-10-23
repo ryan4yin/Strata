@@ -155,6 +155,13 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
+/// STRATA_FUSE_FETCH: wait_flag_ge (or wait_flag_ge_or with `skip`), fetch_blobs and rebase_ptrs in ONE launch.  Block 0
+/// and every block with blob words to copy wait for *flag >= value first (thread 0 spins, unless *skip == value);
+/// the copies are fetch_blobs' and the staged pointers base + k * blob_bytes (k < *n) go to `ptr_out`, NOT over `src`
+/// (other blocks may still be reading it).  The same bytes as the three launches, two kernel nodes fewer.
+void wait_fetch_rebase(const uint32_t* flag, uint32_t value, const uint32_t* skip, const unsigned long long* src,
+                       const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, unsigned long long* ptr_out,
+                       void* stream);
 
 // ---- the MTP draft layer (src/core/mtp.cpp)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).
