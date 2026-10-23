@@ -674,6 +674,17 @@ private:
     void pcie_balance_window(int64_t steps, int G);
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
+    // STRATA_FUSE_ACOMMIT: the batch commit's keep words leave the mapped staging (h_commitb_) by copies launched ahead of
+    // its graph; ev_cbcopy_ follows them and stage_batch waits for it before it writes the staging again
+    cudaEvent_t ev_cbcopy_ = nullptr;
+    void stage_commit_words(const int* rows, int S);
+    // STRATA_DBG_ACOMMIT: the device keep words after the last batch commit (h_echo_) against the host's (echo_want_)
+    int32_t* h_echo_ = nullptr;
+    std::vector<int32_t> echo_want_;
+    std::vector<int> echo_slots_;
+    bool echo_live_ = false;
+    void echo_record(const int* rows, int S);
+    void echo_check();
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

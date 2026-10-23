@@ -867,6 +867,8 @@ Verifier::~Verifier() {
             if (kv.second) cudaGraphExecDestroy(kv.second);
     if (dc_arena_) cudaFree(dc_arena_);
     if (h_commitd_) cudaFreeHost(h_commitd_);
+    if (h_echo_) cudaFreeHost(h_echo_);
+    if (ev_cbcopy_) cudaEventDestroy(ev_cbcopy_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (tap_file_) std::fclose(tap_file_);
@@ -4026,6 +4028,12 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
 }
 
 namespace { bool g_commit_async = false; }
+// STRATA_FUSE_ACOMMIT=1: commit_slot_prefixes launches the batch commit without waiting for it (one card); the commit
+// graphs then leave out the keep words' copies, stage_commit_words launches them ahead of the graph
+static bool fuse_acommit_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ACOMMIT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
@@ -4099,6 +4107,7 @@ bool Verifier::wait_commit(std::string& err) {
         const cudaError_t se = cudaEventSynchronize(commit_done_);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         strata::core::acommit_dbg().clear();
+        echo_check();
     }
     return next_ == nullptr || next_->wait_commit(err);
 }
@@ -4131,6 +4140,12 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
     if (cudaMalloc(&d, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4) != cudaSuccess) {
         err = "verify: the batch buffers do not fit";
+        return false;
+    }
+    void* echo_d = nullptr;
+    if ((cudaEventCreateWithFlags(&ev_cbcopy_, cudaEventDisableTiming) != cudaSuccess) ||
+        (strata::core::AcommitDbg::on() && !mapped((size_t) (S * CB * 4 + 16), (void**) &h_echo_, &echo_d))) {
+        err = "verify: the batch commit events failed";
         return false;
     }
     arena_b_ = d;
@@ -4195,9 +4210,10 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     }
     bool ok = true;
     try {
-        for (int t = 0; t < S; ++t)
-            if (t == 0 || rows[t] != rows[t - 1])
-                copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
+        if (!fuse_acommit_on())   // (STRATA_FUSE_ACOMMIT: stage_commit_words, ahead of the graph)
+            for (int t = 0; t < S; ++t)
+                if (t == 0 || rows[t] != rows[t - 1])
+                    copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
         // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
@@ -4867,6 +4883,11 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
     const int64_t CB = 2 + max_t_;
+    if (fuse_acommit_on()) {   // the last batch commit may still be queued: its words have left the staging first
+        cudaError_t q;
+        while ((q = cudaEventQuery(ev_cbcopy_)) == cudaErrorNotReady) _mm_pause();
+        if (q != cudaSuccess) { err = std::string("verify: batch commit words: ") + cudaGetErrorString(q); return false; }
+    }
     for (int t = 0; t < S;) {
         const int first = t;
         while (t < S && rows[t] == rows[first]) ++t;
@@ -5049,10 +5070,44 @@ bool Verifier::commit_slots(std::string& err) {
     return commit_slot_prefixes(keep.data(), err);
 }
 
-// STRATA_FUSE_ACOMMIT=1: commit_slot_prefixes launches the batch commit without waiting for it (one card)
-static bool fuse_acommit_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ACOMMIT"); return v != nullptr && v[0] == '1'; }();
-    return on;
+void Verifier::stage_commit_words(const int* rows, int S) {
+    if (!fuse_acommit_on()) return;
+    const int64_t CB = 2 + max_t_;
+    for (int t = 0; t < S; ++t)
+        if (t == 0 || rows[t] != rows[t - 1])
+            strata::kernels::copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
+    (void) cudaEventRecord(ev_cbcopy_, cs_);
+}
+
+void Verifier::echo_record(const int* rows, int S) {
+    if (!strata::core::AcommitDbg::on() || h_echo_ == nullptr) return;
+    const int64_t CB = 2 + max_t_;
+    (void) cudaMemcpyAsync(h_echo_, commitb_, (size_t) slots_.size() * CB * 4, cudaMemcpyDeviceToHost, cs_);
+    echo_slots_.clear();
+    echo_want_.clear();
+    for (int t = 0; t < S; ++t)
+        if (t == 0 || rows[t] != rows[t - 1]) {
+            echo_slots_.push_back(rows[t]);
+            echo_want_.insert(echo_want_.end(), h_commitb_ + (size_t) rows[t] * CB, h_commitb_ + (size_t) (rows[t] + 1) * CB);
+        }
+    static long long n = 0;
+    if (strata::core::AcommitDbg::level() == 2 && ++n % 100 == 0) echo_want_[0] += 1000;   // the check's own test
+    echo_live_ = true;
+}
+
+// called where the commit and the echo behind it have run: the next commit (its window synchronized) and wait_commit
+void Verifier::echo_check() {
+    if (!echo_live_) return;
+    echo_live_ = false;
+    const int64_t CB = 2 + max_t_;
+    strata::core::AcommitDbg& d = strata::core::acommit_dbg();
+    for (size_t i = 0; i < echo_slots_.size(); ++i) {
+        ++d.echo_checked;
+        if (std::memcmp(h_echo_ + (size_t) echo_slots_[i] * CB, echo_want_.data() + i * CB, (size_t) CB * 4) != 0 &&
+            ++d.echo_bad <= 8)
+            std::fprintf(stderr, "strata: DBG_ACOMMIT: slot %d's batch commit read keep %d, the host wrote %d\n",
+                         echo_slots_[i], h_echo_[(size_t) echo_slots_[i] * CB], echo_want_[i * CB]);
+    }
 }
 
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
@@ -5063,6 +5118,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const int64_t CB = 2 + max_t_;
     cudaEvent_t after = commit_after_;
     commit_after_ = nullptr;
+    echo_check();   // (the last commit and its echo ran before this window)
     // One prefix per slot: rejected draft rows must not enter recurrent state.
     for (int t = 0; t < S;) {
         const int first = t;
@@ -5083,12 +5139,14 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
         strata::core::TailProf& tp = strata::core::tail_prof();
         const bool tpo = strata::core::TailProf::on() && next_ == nullptr;   // (one stage: the main card's)
         const auto tp0 = tpo ? tp.now() : std::chrono::steady_clock::time_point{};
+        stage_commit_words(last_rows_, S);   // (STRATA_FUSE_ACOMMIT: the copies need not wait for the drafts)
         if (after != nullptr && cudaStreamWaitEvent(cs_, after, 0) != cudaSuccess) {
             err = "verify: batch commit: waiting for the drafts";
             return false;
         }
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+        echo_record(last_rows_, S);
         const auto tp1 = tpo ? tp.now() : tp0;
         if (fuse_acommit_on() && g_commit_async && next_ == nullptr) {
             // STRATA_FUSE_ACOMMIT=1: no wait, commit()'s set_commit_async contract - the next window follows it on cs_, the
@@ -5146,8 +5204,10 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+    if (le == cudaSuccess && !batch_self_commits(rows, S)) {   // (else the window has kept its rows itself)
+        stage_commit_words(rows, S);
         le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    }
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
