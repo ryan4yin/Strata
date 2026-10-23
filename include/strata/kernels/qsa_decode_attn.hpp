@@ -84,6 +84,11 @@ void qsa_decode_attn_batch_chunks(const float* q, const QsaAttnPools& pools, con
 /// launches nothing and returns false (the caller runs the per-row calls).
 bool qsa_decode_attn_wave_chunks(const float* q, const QsaAttnWave& wave, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, float* scratch, void* stream);
+/// fuse-gdn (STRATA_FUSE_GATEMERGE): qsa_decode_attn_batch_merge, then native_qsa_gate_apply(attn, q_full, gated,
+/// n_q * n_head, head_dim) in the same launch - the same bits in attn and gated.  HIP with the v2 merge only; elsewhere
+/// it launches nothing and returns false.
+bool qsa_decode_attn_batch_merge_gate(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch,
+                                      float* attn, const float* q_full, float* gated, int64_t n_q, void* stream);
 void qsa_decode_attn_batch_merge(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
                                  int64_t n_q, void* stream);
 /// For src/kernels/qsa_merge_daily_parity.cpp only: qsa_decode_attn_batch's two passes apart, whatever the environment
