@@ -289,7 +289,12 @@ public:
     static void set_commit_async(bool on);
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
     /// false with `err` when it failed.  Free when nothing is pending.
-    bool wait_commit(std::string& err);
+    bool wait_commit(std::string& err, bool flush = true);
+    /// STRATA_FUSE_GDNDEFER: slot `slot` goes on into the next window (its batch commit may leave its GDN recurrence rows
+    /// to that window); read by the next commit_slot_prefixes, then cleared
+    void set_commit_pend(int slot, bool on) {
+        if (slot >= 0 && slot < (int) pend_want_.size()) pend_want_[(size_t) slot] = on;
+    }
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs).  One conversation's windows with the
     // stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window as `run`, driven
@@ -685,6 +690,23 @@ private:
     bool echo_live_ = false;
     void echo_record(const int* rows, int S);
     void echo_check();
+    // STRATA_FUSE_GDNDEFER: per slot the GDN rows its last batch commit left pending (pend_: pend_layers_ layers of
+    // pend_pl_ floats, pend_pm_ rows of h then of gate then of beta), the device words (n_state, n_pend) per slot at
+    // pendw_ (staged in h_pendw_, after h_commitb_'s words), and which slots hold rows / which graphs take part
+    float* pend_ = nullptr;
+    int64_t pend_layers_ = 0, pend_pl_ = 0, pend_pm_ = 0, pend_gdn0_ = 0;
+    int32_t* pendw_ = nullptr;
+    int32_t* h_pendw_ = nullptr;
+    const int32_t* m_pendw_ = nullptr;
+    std::vector<char> pend_live_, pend_want_;
+    std::map<std::vector<int>, bool> b2_win_, b2_commit_;   // window graphs that run the rows / commits that leave them
+    bool cap_defer_ = false, cap_defer_bad_ = false;
+    bool defer_on() const;
+    bool flush_pend(std::string& err);
+    float* b2_shadow_ = nullptr;   // STRATA_DBG_B2CHECK
+    int b2chk_slot_ = -1;
+    void b2check_record();
+    void b2check_compare();
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)

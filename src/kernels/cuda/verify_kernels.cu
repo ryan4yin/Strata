@@ -322,7 +322,7 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
-template <bool ALL_OUT, bool Q>
+template <bool ALL_OUT, bool Q, bool P = false>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
                                                                      const float* __restrict__ gate,
@@ -344,6 +344,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
     }
+    int pn = 0;   // P (STRATA_FUSE_GDNDEFER): the slot's pending rows
+    if constexpr (P) pn = grp.n > 0 && grp.pend_n[blockIdx.y] != nullptr ? *grp.pend_n[blockIdx.y] : 0;
     __shared__ float sk[2][S], sq[2][S];
     __shared__ float red_kv[RG][S];
     __shared__ float red_o[RG][S];
@@ -359,7 +361,32 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = ALL_OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = (ALL_OUT && !P) ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    if constexpr (P) {
+        if (pn > 0) {   // gdn_step_commit_body's recurrence over the pending rows (its operations, in its order), sk[1]
+            const float* ph = grp.pend_h[blockIdx.y];
+            const float* pg = grp.pend_g[blockIdx.y];
+            const float* pb = grp.pend_b[blockIdx.y];
+            for (int t = 0; t < pn; ++t) {
+                const float* ht = ph + (size_t) t * C;
+                vk_sync_lds();
+                if (rg == 0) sk[1][col] = ht[qk + qh * S + col];
+                vk_sync_lds();
+                const float g = __expf(pg[(size_t) t * h_v + head]);
+                float kv = 0.0f;
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[1][rg * RPG + r], kv);
+                red_kv[rg][col] = kv;
+                vk_sync_lds();
+                const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * pb[(size_t) t * h_v + head];
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[1][rg * RPG + r] * delta);
+            }
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        }
+    }
     const float gam = (rg == 0) ? gamma[col] : 0.0f;
     if (n > 0 && (rg == 0 || (rg == 1 && (ALL_OUT || 0 >= t_out_begin)))) {
         const float kq0 = hbuf[(rg == 0 ? qk : 0) + qh * S + col];
@@ -1252,7 +1279,8 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
 
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
-                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream,
+                       const int32_t* n_state) {
     // gdn_step_commit_layers_kernel is bitwise identical to both per-layer commit kernels (gdn_step_commit_kernel and
     // gdn_state_replay_kernel), so STRATA_GDN_SPLIT=1 also uses the 2-launch batched commit unless STRATA_GDN_COMMIT_SPLIT=0
     static const bool per_layer = [] {
@@ -1268,9 +1296,58 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
         state + conv_off, (long long) state_stride, qkv, (long long) qkv_stride, conv_channels, n_keep);
     gdn_step_commit_layers_kernel<<<dim3((unsigned) h_v, 4u, (unsigned) n_layers), dim3(32, RG), 0, st>>>(
         state, (long long) state_stride, h, (long long) h_stride, conv_channels, gate, beta, (long long) gb_stride, h_k, h_v,
-        n_keep);
+        n_state != nullptr ? n_state : n_keep);
     check("gdn_commit_layers");
     return true;
+}
+
+namespace {
+// gdn_pend_copy_layers: blockIdx.y = the layer; h as float4 (conv_channels % 4 == 0), then gate and beta
+__global__ void gdn_pend_copy_layers_kernel(float* __restrict__ pend, long long pend_stride, int pm,
+                                            const float* __restrict__ h, long long h_stride, const float* __restrict__ gate,
+                                            const float* __restrict__ beta, long long gb_stride, int C, int h_v,
+                                            const int32_t* __restrict__ n_pend) {
+    const int n = *n_pend;
+    if (n <= 0) return;
+    float* dst = pend + (long long) blockIdx.y * pend_stride;
+    const float* hs = h + (long long) blockIdx.y * h_stride;
+    const int c4 = C / 4, nh = n * c4, ng = n * h_v;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < nh + 2 * ng; i += gridDim.x * blockDim.x) {
+        if (i < nh) {
+            const int r = i / c4, c = i % c4;
+            reinterpret_cast<float4*>(dst + (size_t) r * C)[c] = reinterpret_cast<const float4*>(hs + (size_t) r * C)[c];
+        } else if (i < nh + ng) {
+            const int j = i - nh;
+            dst[(size_t) pm * C + j] = gate[(long long) blockIdx.y * gb_stride + j];
+        } else {
+            const int j = i - nh - ng;
+            dst[(size_t) pm * C + (size_t) pm * h_v + j] = beta[(long long) blockIdx.y * gb_stride + j];
+        }
+    }
+}
+}  // namespace
+
+void gdn_pend_copy_layers(float* pend, int64_t pend_stride, int pm, const float* h, int64_t h_stride, const float* gate,
+                          const float* beta, int64_t gb_stride, int conv_channels, int h_v, int n_layers,
+                          const int32_t* n_pend, void* stream) {
+    if (pm < 1 || pm > kVerifyMaxT || conv_channels % 4 != 0 || n_layers < 1 || n_layers > 65535 || !n_pend) {
+        std::fprintf(stderr, "gdn_pend_copy_layers: invalid arguments\n");
+        std::exit(1);
+    }
+    const int work = pm * (conv_channels / 4 + 2 * h_v);
+    gdn_pend_copy_layers_kernel<<<dim3((unsigned) ((work + 255) / 256), (unsigned) n_layers), 256, 0, (cudaStream_t) stream>>>(
+        pend, (long long) pend_stride, pm, h, (long long) h_stride, gate, beta, (long long) gb_stride, conv_channels, h_v,
+        n_pend);
+    check("gdn_pend_copy_layers");
+}
+
+void gdn_pend_apply_layers(float* state, int64_t state_stride, const float* pend, int64_t pend_stride, int pm,
+                           int conv_channels, int h_k, int h_v, int n_layers, const int32_t* n_pend, void* stream) {
+    const float* g = pend + (size_t) pm * conv_channels;
+    gdn_step_commit_layers_kernel<<<dim3((unsigned) h_v, 4u, (unsigned) n_layers), dim3(32, RG), 0, (cudaStream_t) stream>>>(
+        state, (long long) state_stride, pend, (long long) pend_stride, conv_channels, g, g + (size_t) pm * h_v,
+        (long long) pend_stride, h_k, h_v, n_pend);
+    check("gdn_pend_apply_layers");
 }
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
@@ -1306,9 +1383,19 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             std::exit(1);
         }
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
+    bool pend = false;   // STRATA_FUSE_GDNDEFER
+    for (int i = 0; i < groups.n; ++i) pend = pend || groups.pend_n[i] != nullptr;
     // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
     // one-row groups (keep, t_out_begin 0)
-    if (commit)
+    if (pend && !commit) {
+        if (xq_out != nullptr)
+            gdn_step_norm_multi_kernel<true, true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0,
+                static_cast<GdnQ81*>(xq_out), groups);
+        else
+            gdn_step_norm_multi_kernel<true, false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    } else if (commit)
         gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
     else if (xq_out != nullptr)   // fuse-gdn STRATA_FUSE_GDNQ8: + the outputs' q8_1, as gdn_step_norm_multi's xq_out
