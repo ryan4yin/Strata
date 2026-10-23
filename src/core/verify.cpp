@@ -1093,6 +1093,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
         staged_ptr_ = fuse_fetch_on() ? b.take<unsigned long long>(kStagingBlobs) : nullptr;   // last: the rest as before
+        // STRATA_FUSE_SWIGLU_GU: the expdec gate/up kernel's column-chunk counters, a set per group (zeroed with the arena)
+        sw_cnt_ = strata::kernels::native_expert_fuse_sw_gu() ? b.take<uint32_t>(2 * 4096) : nullptr;
     };
     Bump count;
     carve(count);
@@ -2502,7 +2504,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
+                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy,
+                                      sw_cnt_ != nullptr ? sw_cnt_ + (size_t) grp * 4096 : nullptr);
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);

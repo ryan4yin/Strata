@@ -695,6 +695,7 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     unsigned long long* staged_ptr_ = nullptr;                    // STRATA_FUSE_FETCH: the staged copies' pointers, per group
+    uint32_t* sw_cnt_ = nullptr;                                  // STRATA_FUSE_SWIGLU_GU: native_expert_grouped's counters, 4096 a group
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;

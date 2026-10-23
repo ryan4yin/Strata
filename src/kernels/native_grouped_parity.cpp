@@ -109,6 +109,7 @@ struct Setup {
     size_t out_floats = 0;
     unsigned long long* ptr = nullptr;
     int32_t *start = nullptr, *n = nullptr, *dst = nullptr, *tok = nullptr;
+    uint32_t* cnt = nullptr;   // STRATA_FUSE_SWIGLU_GU's per-group counters (zero between calls)
 
     Setup(int gu, int dt, int64_t H, int64_t FF, int tokens, int k_per_token, int blobs_n, std::mt19937& rng,
           cudaStream_t s) {
@@ -142,10 +143,11 @@ struct Setup {
         n = dalloc<int32_t>(1);
         dst = dalloc<int32_t>(cap);
         tok = dalloc<int32_t>(cap);
+        cnt = dalloc<uint32_t>(4096);
     }
     ~Setup() {
         cudaFree(blobs); cudaFree(xq); cudaFree(scr); cudaFree(out);
-        cudaFree(ptr); cudaFree(start); cudaFree(n); cudaFree(dst); cudaFree(tok);
+        cudaFree(ptr); cudaFree(start); cudaFree(n); cudaFree(dst); cudaFree(tok); cudaFree(cnt);
     }
     // a plan: `groups` groups of 1..T entries from entry `base` on (as many as fit in cap)
     int plan(int groups, int base, std::mt19937& rng) {
@@ -188,7 +190,7 @@ struct Setup {
         return ng;
     }
     void call(int64_t grid_groups, cudaStream_t s) {
-        k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, grid_groups);
+        k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, grid_groups, cnt);
     }
     // `out` after one call from the NaN pattern, the scratch holding `junk` (what earlier calls left there)
     std::vector<uint32_t> result(bool v1, int64_t grid_groups, int junk, cudaStream_t s) {
@@ -262,6 +264,59 @@ void check_sw_down(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
     g_fail += bad;
 }
 
+// STRATA_FUSE_SWIGLU_GU: the expdec gate/up kernel's last block per group making h's q8_1 blocks, against the SwiGLU +
+// q8_1 launch: `out` and the active hq bytes bitwise, and the counters zero again after every call
+void check_sw_gu(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+    Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);
+    int calls = 0, bad = 0;
+    size_t written = 0;
+    auto run = [&](bool sw, int64_t gy, int junk) {
+        k::native_expert_set_fuse_sw_gu(sw ? 1 : 0);
+        auto o = S.result(false, gy, junk, s);
+        k::native_expert_set_fuse_sw_gu(-1);
+        std::vector<uint32_t> c(4096);
+        ck(cudaMemcpy(c.data(), S.cnt, 4096 * 4, cudaMemcpyDeviceToHost), "cnt");
+        for (const uint32_t v : c) if (v != 0) { std::printf("  counters not zero after a call  FAIL\n"); ++bad; break; }
+        return o;
+    };
+    k::native_expert_set_expdec(1);
+    {   // the fused path is the one run: with the counters off zero no block is a group's last, h stays unwritten
+        S.plan(3, 0, rng);
+        const auto ref = run(false, 0, 0x00);
+        ck(cudaMemset(S.cnt, 0x01, 4096 * 4), "cnt");
+        k::native_expert_set_fuse_sw_gu(1);
+        auto o = S.result(false, 0, 0x00, s);
+        k::native_expert_set_fuse_sw_gu(-1);
+        ck(cudaMemset(S.cnt, 0, 4096 * 4), "cnt");
+        if (o == ref) { std::printf("  poisoned counters changed nothing: the fused path did not run  FAIL\n"); ++bad; }
+    }
+    for (const int base : {0, 7}) {
+        for (const int groups : {0, 1, 2, 3, 5, 8, 24}) {
+            const int ng = S.plan(groups, base, rng);
+            for (const int64_t gy : {(int64_t) 0, (int64_t) 2, (int64_t) S.cap + 3}) {
+                const auto ref = run(false, gy, 0x00);
+                for (size_t i = 0; i < S.out_floats; ++i) written += ref[i] != 0xFFFFFFFFu;
+                for (int rep = 0; rep < 2; ++rep) {   // twice: the second call starts from the counters the first left
+                    const auto got = run(true, gy, (calls & 1) ? 0x7F : 0x00);
+                    ++calls;
+                    size_t diff = 0;
+                    for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+                    if (diff) {
+                        std::printf("  %-8s/%-7s base %d, %d groups, grid_groups %lld: %zu of %zu output/Q8 words differ  FAIL\n",
+                                    name_of(gu), name_of(dt), base, ng, (long long) gy, diff, ref.size());
+                        ++bad;
+                    }
+                }
+            }
+        }
+    }
+    k::native_expert_set_expdec(-1);
+    std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
+                (long long) H, (long long) FF, calls, bad ? "FAIL" : "STRATA_FUSE_SWIGLU_GU bitwise equal (out + hq)", written);
+    if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
+    g_fail += bad;
+}
+
 void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
@@ -324,19 +379,21 @@ struct Layers {
 };
 
 // the 48 calls of one variant captured in one graph
-cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, int64_t gy, int sw = -1) {
+cudaGraphExec_t make_graph(cudaStream_t s, Setup& S, const Layers& Ls, bool v1, int64_t gy, int sw = -1, int swgu = -1) {
     k::native_grouped_set_v1(v1);
     k::native_expert_set_fuse_sw_down(sw);
+    k::native_expert_set_fuse_sw_gu(swgu);
     cudaGraph_t g;
     cudaGraphExec_t ge;
     ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
     for (int l = 0; l < 48; ++l)
-        k::native_expert_grouped(S.L, Ls.ptr[l], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr, S.out, s, gy);
+        k::native_expert_grouped(S.L, Ls.ptr[l], S.start, S.n, S.dst, S.tok, S.cap, S.cap, S.xq, S.scr, S.out, s, gy, S.cnt);
     ck(cudaStreamEndCapture(s, &g), "capture");
     ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
     ck(cudaGraphDestroy(g), "graph");
     k::native_grouped_set_v1(false);
     k::native_expert_set_fuse_sw_down(-1);
+    k::native_expert_set_fuse_sw_gu(-1);
     return ge;
 }
 
@@ -394,13 +451,14 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         std::printf("  %-42s %8.2f / %8.2f us (grid_groups %lld)\n", r.what, median(ta), median(tb), (long long) r.gy);
     }
     // STRATA_FUSE_SWIGLU_DOWN off / on: the model's IQ4_NL / Q2_0 downs at 2560 x 640, expdec on (Q2_0's fused down)
-    std::printf("--bench STRATA_FUSE_SWIGLU_DOWN: off / on, us per call (same graphs and medians as above)\n");
+    std::printf("--bench STRATA_FUSE_SWIGLU_DOWN + STRATA_FUSE_SWIGLU_GU: off / on, us per call (same graphs and medians as above)\n");
+    k::native_expert_set_expdec(1);   // the engine's gfx12 default (expdec gate/up)
     for (const int dt : {20, 42}) {
         Setup W(21, dt, 2560, 640, 4, 10, 32, rng, s);
         for (const auto& r : rows) {
             const int ng = W.plan_sizes(r.sizes, 0, rng);
             const Layers Ls(W, ng);
-            cudaGraphExec_t ga = make_graph(s, W, Ls, false, r.gy, 0), gb = make_graph(s, W, Ls, false, r.gy, 1);
+            cudaGraphExec_t ga = make_graph(s, W, Ls, false, r.gy, 0, 0), gb = make_graph(s, W, Ls, false, r.gy, 1, 1);
             std::vector<float> ta, tb;
             for (int i = 0; i < kWarmPairs + kPairs; ++i) {
                 const bool a_first = i % 2 == 0;
@@ -414,6 +472,7 @@ void bench(cudaStream_t s, std::mt19937& rng) {
             std::printf("  IQ3_S/%-7s %-42s %8.2f / %8.2f us\n", name_of(dt), r.what, median(ta), median(tb));
         }
     }
+    k::native_expert_set_expdec(-1);
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
 }
@@ -438,6 +497,8 @@ int main(int argc, char** argv) {
     for (int gu : {16, 17, 18, 21, 22})
         for (int dt : {20, 42}) check_sw_down(gu, dt, 2560, 640, s, rng);
     check_sw_down(21, 23, 2560, 768, s, rng);   // not fused (IQ4_XS down): the launches as before
+    for (int gu : {16, 17, 18, 21, 22})
+        for (int dt : {20, 42}) check_sw_gu(gu, dt, 2560, 640, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
