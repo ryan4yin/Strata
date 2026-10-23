@@ -1606,11 +1606,11 @@ __global__ void b6_mmvq_rows_pair_kernel(const typename F::Block* __restrict__ w
 
 
 #if defined(__HIPCC__)
-// STRATA_Q6K_V2=1 (AMD): native_mmvq_multi_kernel<Q6KTraits, NC, WARPS, ROWS> (exact) and b6_mmvq_rows_kernel<Q6KTraits,
-// NC, ROWS> - a thread's blocks kbx = tid / 32 + 4 it, its sums in the same order, the same cross-warp reduction - with
-// every load of the thread issued before any use: the NI iterations' weight words of all ROWS rows, then their
-// activation words (once for all rows), nothing converted in between (loadcnt retires in order: the first iteration's
-// use waits for its own words only).  V1 issues one iteration's loads and waits on each in turn.  dp4a x scale as a
+// STRATA_Q6K_V2=1 (AMD): native_q6_k_mmvq_kernel<false> (1 column), native_mmvq_multi_kernel<Q6KTraits, NC, WARPS,
+// ROWS> (exact) and b6_mmvq_rows_kernel<Q6KTraits, NC, ROWS> - a thread's blocks kbx = tid / 32 + 4 it, its sums in
+// the same order, the same cross-warp reduction - with every load of the thread issued before any use: the NI
+// iterations' weight words of all ROWS rows, then their activation words (once for all rows), nothing converted in
+// between (loadcnt retires in order: the first iteration's use waits for its own words only).  V1 issues one iteration's loads and waits on each in turn.  dp4a x scale as a
 // 24-bit product: |dp| <= 4 x 32 x 128 = 16384, |sc| <= 128, < 2^23: exact.  The floats as explicit fmas, as V1
 // contracts them (every instance, checked in its ISA): s = fma(d8_0, f0, 0), s = fma(d8_1, f1, s), tmp = fma(d, s, tmp).
 // The last iteration's loads past the row (threads with kbx >= blocks_per_row) and rows past n_out are clamped and
@@ -1738,7 +1738,7 @@ bool q6k_v2_go(const Q6KBlock* w, const Q81Block* x, float* y, int n_in, int n_o
 template<typename F, int NCOLS>
 bool q6k_v2_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
 #if defined(__HIPCC__)
-    if constexpr (std::is_same_v<F, Q6KTraits> && NCOLS >= 2 && NCOLS <= 4) {
+    if constexpr (std::is_same_v<F, Q6KTraits> && NCOLS >= 1 && NCOLS <= 4) {
         if (!q6k_v2_on()) return false;
         if (q6k_v2_go<NCOLS, 2>(w, x, y, n_in, n_out, s)) return true;
         static bool said = false;
@@ -3452,6 +3452,10 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     const auto* w = static_cast<const Q6KBlock*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
+    if (n_in / 256 >= WARPS * WARP / 32 && q6k_v2_launch<Q6KTraits, 1>(w, x, y, n_in, n_out, s)) {   // STRATA_Q6K_V2
+        launch_check();
+        return;
+    }
     const dim3 threads(WARP, WARPS);
     if (n_in / 256 < WARPS * WARP / 32) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
