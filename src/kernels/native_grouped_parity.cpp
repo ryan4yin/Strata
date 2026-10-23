@@ -111,8 +111,10 @@ struct Setup {
     int32_t *start = nullptr, *n = nullptr, *dst = nullptr, *tok = nullptr;
     uint32_t* cnt = nullptr;   // STRATA_FUSE_SWIGLU_GU's per-group counters (zero between calls)
 
+    // extreme: every gate/up byte after the fp16 scale 0xFF (the largest grid codes, all signs, 4-bit scales 15) and
+    // x = -1 everywhere (q8_1 bytes -127): the largest integer sums
     Setup(int gu, int dt, int64_t H, int64_t FF, int tokens, int k_per_token, int blobs_n, std::mt19937& rng,
-          cudaStream_t s) {
+          cudaStream_t s, bool extreme = false) {
         L = k::native_expert_layout(gu, dt, H, FF);
         T = tokens; K = k_per_token; cap = T * K; n_blobs = blobs_n;
         slot = (L.bytes + 255) & ~(size_t) 255;
@@ -120,6 +122,10 @@ struct Setup {
         for (int b = 0; b < n_blobs; ++b) {
             // gate rows | up rows (format gu, H values each) | down rows (format dt, FF values each)
             auto blob = random_rows(gu, 2 * FF, H, rng);
+            if (extreme) {
+                const size_t bs = k::iq_row_bytes(gu, block_values(gu));
+                for (size_t o = 0; o < blob.size(); o += bs) std::memset(&blob[o + 2], 0xFF, bs - 2);
+            }
             const auto down = random_rows(dt, H, FF, rng);
             blob.insert(blob.end(), down.begin(), down.end());
             if (blob.size() != L.bytes) { std::fprintf(stderr, "blob %zu != %zu bytes\n", blob.size(), L.bytes); std::exit(2); }
@@ -127,7 +133,7 @@ struct Setup {
         }
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) T * H);
-        for (auto& v : x) v = nd(rng);
+        for (auto& v : x) v = extreme ? -1.0f : nd(rng);
         float* dx = dalloc<float>(x.size());
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         xq = dalloc<uint8_t>((size_t) T * (H / 32) * 36);
@@ -317,6 +323,83 @@ void check_sw_gu(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt1
     g_fail += bad;
 }
 
+// STRATA_EXPDEC_V2 (expdec_gu_v2_kernel, native_down_v2_kernel) against the kernels it replaces, expdec on: `out` and
+// the active hq bytes bitwise, STRATA_FUSE_SWIGLU_GU / _DOWN off and on, grid_groups below / at / above the groups,
+// the SwiGLU counters zero after every call; `extreme`: Setup's largest codes and scales (the 24-bit products' bound)
+void check_v2(int gu, int dt, int64_t H, int64_t FF, bool extreme, cudaStream_t s, std::mt19937& rng) {
+    Setup S(gu, dt, H, FF, 6, 4, 9, rng, s, extreme);
+    int calls = 0, bad = 0;
+    size_t written = 0;
+    const k::NativeExpertExpdecParams p0 = k::native_expert_expdec_params();
+    auto run = [&](int v2, int swgu, int swd, int64_t gy, int junk) {
+        k::NativeExpertExpdecParams p = p0;
+        p.v2 = v2;
+        k::native_expert_set_expdec_params(p);
+        k::native_expert_set_fuse_sw_gu(swgu);
+        k::native_expert_set_fuse_sw_down(swd);
+        auto o = S.result(false, gy, junk, s);
+        k::native_expert_set_fuse_sw_gu(-1);
+        k::native_expert_set_fuse_sw_down(-1);
+        std::vector<uint32_t> c(4096);
+        ck(cudaMemcpy(c.data(), S.cnt, 4096 * 4, cudaMemcpyDeviceToHost), "cnt");
+        for (const uint32_t v : c) if (v != 0) { std::printf("  counters not zero after a call  FAIL\n"); ++bad; break; }
+        return o;
+    };
+    k::native_expert_set_expdec(1);
+    if (dt == 20) {   // V2's fused SwiGLU ran: with the counters off zero no block is a chunk's last, h stays unwritten
+        S.plan(3, 0, rng);
+        const auto ref = run(1, 1, 0, 0, 0x00);
+        ck(cudaMemset(S.cnt, 0x01, 4096 * 4), "cnt");
+        k::NativeExpertExpdecParams p = p0;
+        p.v2 = 1;
+        k::native_expert_set_expdec_params(p);
+        k::native_expert_set_fuse_sw_gu(1);
+        const auto o = S.result(false, 0, 0x00, s);
+        k::native_expert_set_fuse_sw_gu(-1);
+        ck(cudaMemset(S.cnt, 0, 4096 * 4), "cnt");
+        if (o == ref) { std::printf("  poisoned counters changed nothing: V2's fused path did not run  FAIL\n"); ++bad; }
+    }
+    for (const int swgu : {0, 1})
+        for (const int swd : {0, 1})
+            for (const int base : {0, 7})
+                for (const int groups : {0, 1, 2, 3, 5, 8, 24}) {
+                    const int ng = S.plan(groups, base, rng);
+                    for (const int64_t gy : {(int64_t) 0, (int64_t) 1, (int64_t) 2, (int64_t) 3, (int64_t) 4, (int64_t) S.cap + 3}) {
+                        const int junk = (calls & 1) ? 0x7F : 0x00;
+                        const auto ref = run(0, swgu, swd, gy, junk);
+                        for (size_t i = 0; i < S.out_floats; ++i) written += ref[i] != 0xFFFFFFFFu;
+                        for (int rep = 0; rep < 2; ++rep) {   // twice: the second from the counters the first left
+                            const auto got = run(1, swgu, swd, gy, junk);
+                            ++calls;
+                            size_t diff = 0;
+                            for (size_t i = 0; i < ref.size(); ++i) {
+                                if (ref[i] != got[i] && diff < 3 && bad < 2) {
+                                    float rf, gf;
+                                    std::memcpy(&rf, &ref[i], 4);
+                                    std::memcpy(&gf, &got[i], 4);
+                                    std::printf("    word %zu (row %zu col %zu%s): %08x %g vs %08x %g\n", i, i / (size_t) H, i % (size_t) H,
+                                                i >= S.out_floats ? ", hq" : "", ref[i], rf, got[i], gf);
+                                }
+                                diff += ref[i] != got[i];
+                            }
+                            if (diff) {
+                                std::printf("  %-8s/%-7s sw_gu %d sw_down %d base %d, %d groups, grid_groups %lld: %zu of %zu "
+                                            "output/Q8 words differ  FAIL\n", name_of(gu), name_of(dt), swgu, swd, base, ng,
+                                            (long long) gy, diff, ref.size());
+                                ++bad;
+                            }
+                        }
+                    }
+                }
+    k::native_expert_set_expdec(-1);
+    k::native_expert_set_expdec_params(p0);
+    std::printf("%-8s/%-7s %5lld x %4lld%s  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
+                (long long) H, (long long) FF, extreme ? " extreme" : "", calls,
+                bad ? "FAIL" : "STRATA_EXPDEC_V2 bitwise equal (out + hq)", written);
+    if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
+    g_fail += bad;
+}
+
 void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
@@ -499,6 +582,12 @@ int main(int argc, char** argv) {
     check_sw_down(21, 23, 2560, 768, s, rng);   // not fused (IQ4_XS down): the launches as before
     for (int gu : {16, 17, 18, 21, 22})
         for (int dt : {20, 42}) check_sw_gu(gu, dt, 2560, 640, s, rng);
+    // STRATA_EXPDEC_V2: its gate/up formats under the IQ4_NL down (and Q2_0's: the V2 gate/up alone), the largest codes
+    for (int gu : {22, 18})
+        for (const bool extreme : {false, true}) {
+            check_v2(gu, 20, 2560, 640, extreme, s, rng);
+            if (!extreme) check_v2(gu, 42, 2560, 640, false, s, rng);
+        }
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

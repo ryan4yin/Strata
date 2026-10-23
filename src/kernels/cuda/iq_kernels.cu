@@ -2644,6 +2644,380 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(
     }
 }
 
+#if defined(__HIPCC__)
+// ---------------------------------------------------------------- EXPDEC V2 (STRATA_EXPDEC_V2=1, AMD): expdec_gu_kernel
+// (R 1) with every weight read of the block issued at once, before any wait.  The weights are read through global
+// pointers (from grp_ptr the loads were flat: they count in dscnt too, so every LDS wait also waited for the DRAM reads
+// in flight), all the block's passes at once (raw words in registers), then the L2 staging loads (loadcnt retires in
+// order, so the one wait covers both).  The decode gives the same W as Split<TG>::load<true>: the sign nibbles spread
+// to byte masks m in registers (an LDS table of them was slower), applied as (g ^ m) + (m & 0x01010101) - vsub4(g ^ m,
+// m) since no grid byte is 0 (the IQ3_XXS staged path's identity).  One pass a block (rb 16) is the fast one.
+// apply_u's integer products as signed 24-bit ones (v_mul_i32_i24), exact: a sumi is at most 32 products of a signed
+// weight byte (|g| <= 127) and a q8_1 byte (|u| <= 128), |sumi| <= 32 x 127 x 128 = 520192 < 2^23, and the scales are
+// 4-bit (0..15); the floats as apply_u.
+using ed_g8 = const __attribute__((address_space(1))) uint8_t;
+__device__ __forceinline__ uint32_t ed_ld16(ed_g8* p) { return *(const __attribute__((address_space(1))) uint16_t*) p; }
+__device__ __forceinline__ uint32_t ed_ld_b2(ed_g8* p) { return ed_ld16(p) | ed_ld16(p + 2) << 16; }
+// g with byte i negated where bit i of the 4-bit sign nibble x is set: t = bit i of x at byte i, m = 255 t
+__device__ __forceinline__ int ed_neg4(uint32_t g, uint32_t x) {
+    const uint32_t t = __umul24(x, 0x00204081u) & 0x01010101u;
+    uint32_t t8 = t << 8;
+    asm("" : "+v"(t8));   // (t << 8) - t stays a shift and a subtract (folded, it was t * 255: v_mul_lo_u32, quarter rate)
+    return (int) ((g ^ (t8 - t)) + t);
+}
+
+template<int TG> struct EdV2;
+template<> struct EdV2<22> {   // IQ2_S: a call's qs and signs words, qh and scales bytes, d
+    static constexpr int GW = 1024, B = sizeof(block_iq2_s);   // codebook pairs, block bytes
+    static_assert(B == 82, "IQ2_S block");
+    struct Raw { uint32_t qs, sg, qh, sc, d; };
+    using W = Split<22>::W;
+    __device__ static Raw load(ed_g8* blk, int ib) {
+        Raw w;
+        w.qs = ed_ld_b2(blk + 2 + 4 * ib);
+        w.sg = ed_ld_b2(blk + 2 + 32 + 4 * ib);
+        w.qh = blk[66 + ib];
+        w.sc = blk[74 + ib];
+        w.d = ed_ld16(blk);
+        return w;
+    }
+    __device__ static void opaque(Raw& w) { asm volatile("" : "+v"(w.qs), "+v"(w.sg), "+v"(w.qh), "+v"(w.sc), "+v"(w.d)); }
+    __device__ static W decode(const Raw& w, const uint32_t* __restrict__ s_grid) {
+        const uint2* grid = (const uint2*) s_grid;
+        W r;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t gi = ((w.qs >> (8 * i)) & 0xff) | ((w.qh << (8 - 2 * i)) & 0x300);
+            const uint2 gp = grid[gi];
+            const uint32_t sp = (w.sg >> (8 * i)) & 0xff;
+            r.g[2 * i + 0] = ed_neg4(gp.x, sp & 0xf);
+            r.g[2 * i + 1] = ed_neg4(gp.y, sp >> 4);
+        }
+        r.ls0 = w.sc & 0x0F;
+        r.ls1 = w.sc >> 4;
+        r.dw = __half2float(__ushort_as_half((unsigned short) w.d));
+        return r;
+    }
+    __device__ static float apply(const W& r, const int (&u)[8], float d8) {
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sumi0 = ggml_cuda_dp4a(r.g[j], u[j], sumi0);
+#pragma unroll
+        for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], u[j], sumi1);
+        const int sumi = (__mul24(sumi0, r.ls0) + __mul24(sumi1, r.ls1) + (sumi0 + sumi1) / 2) / 4;
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
+};
+template<> struct EdV2<18> {   // IQ3_XXS: a call's 8 grid bytes and its signs + scale word, d
+    static constexpr int GW = 128, B = sizeof(block_iq3_xxs);   // codebook pairs, block bytes
+    static_assert(B == 98, "IQ3_XXS block");
+    struct Raw { uint32_t q0, q1, aux, d; };
+    using W = Split<18>::W;
+    __device__ static Raw load(ed_g8* blk, int ib) {
+        Raw w;
+        w.q0 = ed_ld_b2(blk + 2 + 8 * ib);
+        w.q1 = ed_ld_b2(blk + 2 + 8 * ib + 4);
+        w.aux = ed_ld_b2(blk + 2 + 64 + 4 * ib);
+        w.d = ed_ld16(blk);
+        return w;
+    }
+    __device__ static void opaque(Raw& w) { asm volatile("" : "+v"(w.q0), "+v"(w.q1), "+v"(w.aux), "+v"(w.d)); }
+    __device__ static W decode(const Raw& w, const uint32_t* __restrict__ s_grid) {
+        W r;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q = i < 2 ? w.q0 : w.q1;
+            const uint32_t qx = (q >> (16 * (i & 1))) & 0xff, qy = (q >> (16 * (i & 1) + 8)) & 0xff;
+            const uint32_t gx = s_grid[qx], gy = s_grid[qy];
+            const uint32_t v = (w.aux >> (7 * i)) & 0x7f;
+            const uint32_t sb = v | ((__popc(v) & 1u) << 7);   // the 8th sign: the parity of the 7
+            r.g[2 * i + 0] = ed_neg4(gx, sb & 0xf);
+            r.g[2 * i + 1] = ed_neg4(gy, sb >> 4);
+        }
+        r.ls = w.aux >> 28;
+        r.dw = __half2float(__ushort_as_half((unsigned short) w.d));
+        return r;
+    }
+    __device__ static float apply(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
+        sumi = (__mul24(r.ls, sumi) + sumi / 2) / 2;
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
+};
+
+// The NP passes of 16 rows of a block (rb = 16 NP; sub-warp sw takes row row_base + 16 p + sw), lane t: calls
+// t + 32 j (j < 3) into s and t + 16 + 32 j (j < 2) into s16, as ed_gu_rows<TG, 1, NC>: kbx = t / 8 + {0, 4, 8},
+// {2, 6}, the sub-block t % 8.
+#ifndef STRATA_EXPDEC_V2_MINB
+#define STRATA_EXPDEC_V2_MINB 8   // __launch_bounds__ min blocks (expdec_gu_kernel's MINB 4 on HIP: 8, <= 192 registers)
+#endif
+template<int TG, int NP, bool SWE = false>
+__global__ void __launch_bounds__(256, STRATA_EXPDEC_V2_MINB) expdec_gu_v2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                           const int32_t* __restrict__ grp_start,
+                                                           const int32_t* __restrict__ n_groups,
+                                                           const int32_t* __restrict__ ent_tok,
+                                                           const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                           float* __restrict__ gate, float* __restrict__ up, int rb,
+                                                           block_q8_1* __restrict__ sw_hq = nullptr,
+                                                           uint32_t* __restrict__ sw_cnt = nullptr) {
+    using V = EdV2<TG>;
+    using F = Fmt<TG>;
+    static_assert(F::ipb == 8 && F::step == 2, "8 calls a 256-value block");
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
+    __shared__ float s_ds[ED_NC * ED_XB];
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, 2 * V::GW);
+    const int tid = threadIdx.x;
+    const int sw = tid >> 4, t = tid & 15, kb = t >> 3, ib = t & 7;
+    const int nrow = 2 * (int) L.n_ff, n_ff = (int) L.n_ff;
+    const int row_base = blockIdx.x * rb;
+    bool first = true;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        if (!first) iq_sync_lds();
+        // every pass's raw weight words, then (L2) the codebook (first group) and the first ED_NC entries' q8_1 words:
+        // all issued before any wait, nothing converted before the LDS stores (a use right after a load waits for it)
+        typename V::Raw raw[NP][5];
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            const int row0 = row_base + p * 16 + sw;
+            const int rr = row0 < nrow ? row0 : 0;
+            const bool is_up = rr >= n_ff;
+            ed_g8* wr = (ed_g8*) (blob + (is_up ? L.up_off : 0) + (size_t) (is_up ? rr - n_ff : rr) * L.gu_row);
+#pragma unroll
+            for (int j = 0; j < 5; ++j) {
+                const int kbx = kb + (j < 3 ? 4 * j : 2 + 4 * (j - 3));
+                raw[p][j] = V::load(wr + kbx * V::B, ib);
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        constexpr int NCB = (V::GW + 255) / 256;
+        uint2 cb[NCB];
+        if (first) {   // block-uniform
+            const uint2* src = TG == 22 ? (const uint2*) iq2s_grid : (const uint2*) iq3xxs_grid;
+#pragma unroll
+            for (int i = 0; i < NCB; ++i) cb[i] = src[min(tid + 256 * i, V::GW - 1)];
+        }
+        const int sk = tid >> 1, sh = tid & 1, n0 = min(ED_NC, e1 - e0);
+        const int skc = min(sk, ED_XB - 1), tdc = min(tid, ED_XB - 1);
+        int4 sv[ED_NC];
+        int sd[ED_NC];
+#pragma unroll
+        for (int c = 0; c < ED_NC; ++c) {
+            const int* w32 = (const int*) (xq + (size_t) ent_tok[n0 > 0 ? e0 + min(c, n0 - 1) : 0] * ED_XB);
+            const int* q = w32 + skc * 9 + 1 + 4 * sh;
+            sv[c] = make_int4(q[0], q[1], q[2], q[3]);
+            sd[c] = w32[tdc * 9];
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (first) {
+            uint2* dst = (uint2*) s_grid_buf;
+#pragma unroll
+            for (int i = 0; i < NCB; ++i)
+                if (tid + 256 * i < V::GW) dst[tid + 256 * i] = cb[i];
+        }
+#pragma unroll
+        for (int c = 0; c < ED_NC; ++c) {
+            if (c < n0) {
+                if (sk < ED_XB) s_u[(c * 2 + sh) * ED_XB + sk] = sv[c];
+                if (tid < ED_XB) s_ds[c * ED_XB + tid] = __low2float(*reinterpret_cast<const half2*>(&sd[c]));
+            }
+        }
+        first = false;
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (e > e0) {
+                iq_sync_lds();
+                for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(s_u, s_ds, c, xq + (size_t) ent_tok[e + c] * ED_XB, tid);
+            }
+            iq_sync_lds();
+            // the decode stays in the chunk (hoisted out of the loop, its LDS addresses took every register: spills)
+#pragma unroll
+            for (int p = 0; p < NP; ++p)
+#pragma unroll
+                for (int j = 0; j < 5; ++j) V::opaque(raw[p][j]);
+            auto run = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+#pragma unroll
+                for (int p = 0; p < NP; ++p) {
+                    const int row0 = row_base + p * 16 + sw;
+                    if (row_base + p * 16 >= nrow) break;   // uniform over the block
+                    const bool is_up = row0 >= n_ff;
+                    const int r0 = is_up ? row0 - n_ff : row0;
+                    float s[NC], s16[NC];
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) { s[c] = 0.0f; s16[c] = 0.0f; }
+#pragma unroll
+                    for (int j = 0; j < 5; ++j) {
+                        const int k = t + (j < 3 ? 32 * j : 16 + 32 * (j - 3));
+                        const typename V::W w = V::decode(raw[p][j], s_grid_buf);
+#pragma unroll
+                        for (int c = 0; c < NC; ++c) {
+                            int u[8];
+                            ed_load_u<ED_XB>(s_u, c, k, u);
+                            const float d8 = s_ds[c * ED_XB + k];
+                            if (j < 3) s[c] += V::apply(w, u, d8);
+                            else s16[c] += V::apply(w, u, d8);
+                        }
+                    }
+                    float* dst = is_up ? up : gate;
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        s[c] = __fadd_rn(s[c], s16[c]);
+#pragma unroll
+                        for (int o = 8; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+                    }
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c) dst[(size_t) (e + c) * n_ff + r0] = s[c];
+                }
+            };
+            switch (n) {
+                case 1: run(std::integral_constant<int, 1>{}); break;
+                case 2: run(std::integral_constant<int, 2>{}); break;
+                case 3: run(std::integral_constant<int, 3>{}); break;
+                default: run(std::integral_constant<int, 4>{}); break;
+            }
+        }
+        if constexpr (SWE) {   // expdec_gu_kernel's, per 32-column chunk: its gate and up rows' 64 / rb blocks, the last
+            const int nch = n_ff / 32, ch = (row_base % n_ff) / 32;   // of them (the counter back to 0) makes h
+            __shared__ int s_last;
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) s_last = atomicAdd(sw_cnt + g * nch + ch, 1u) == (uint32_t) (64 / rb - 1);
+            __syncthreads();
+            if (s_last) {
+                __threadfence();
+                const int warp = tid >> 5, lane = tid & 31;
+                for (int c = warp; c < e1 - e0; c += 8) {
+                    const long long i = (long long) (e0 + c) * n_ff + (long long) ch * 32 + lane;
+                    int8_t q;
+                    half2 ds;
+                    sw_q8_1_value(gate[i], up[i], q, ds);
+                    sw_hq[i / 32].qs[lane] = q;
+                    if (lane == 0) sw_hq[i / 32].ds = ds;
+                }
+                if (tid == 0) sw_cnt[g * nch + ch] = 0;
+            }
+        }
+    }
+}
+
+// IQ4_NL down rows at n_ff 640 (STRATA_EXPDEC_V2): native_down_multi_kernel<20, true>'s 8-lane rows, 32 a block, and
+// its sums (row_dot_40_sub8: lane t takes the calls t, t + 32, t + 16, t + 8, t + 24 of its row, in that order and
+// tree), with the row's raw words - 2 words and d per call - read through a global pointer and issued before the
+// staging; the activations staged as expdec's (ed_stage_entry<ED_HB, false> / sw_stage_ed: the same words and the same
+// __low2float(ds)), read as ed_d20_rows does; the 16-value table through v_perm (the lookup's exact values).
+__device__ __forceinline__ int2 ed_iq4nl_lut(uint32_t q4, const uint32_t (&v)[4]) {
+    const uint32_t qe = q4, qo = q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(v[1], v[0], qe & 0x07070707u), ol = __builtin_amdgcn_perm(v[1], v[0], qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(v[3], v[2], qe & 0x07070707u), oh = __builtin_amdgcn_perm(v[3], v[2], qo & 0x07070707u);
+    return make_int2((int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1)),
+                     (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1)));
+}
+template<bool SW>
+__global__ void __launch_bounds__(256) native_down_v2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_dst,
+                                                             const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                             float* __restrict__ out, const float* __restrict__ sw_gate = nullptr,
+                                                             const float* __restrict__ sw_up = nullptr) {
+    using S = Split<20>;
+    static_assert(sizeof(block_iq4_nl) == 18 && ED_HB == 20, "IQ4_NL down rows of 20 blocks");
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ alignas(16) int4 s_u[ED_NC * ED_HB * 2];
+    __shared__ float s_ds[ED_NC * ED_HB];
+    const int2* s_p = reinterpret_cast<const int2*>(s_u);
+    const int tid = threadIdx.x, t = tid & 7, par = t & 1;
+    const int r = blockIdx.x * 32 + (tid >> 3);
+    const bool valid_r = r < L.n_embd;
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    uint32_t tab[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        tab[i] = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) tab[i] |= (uint32_t) (uint8_t) kvalues_iq4nl[4 * i + b] << (8 * b);
+    }
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        ed_g8* wr = (ed_g8*) ((const uint8_t*) grp_ptr[g] + w_off);
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        // the 5 calls' raw words (k = t, t + 32, t + 16, t + 8, t + 24: block k / 2, words 2 (k % 2) and + 1)
+        uint32_t q0[5], q1[5], dh[5];
+#pragma unroll
+        for (int j = 0; j < 5; ++j) {
+            const int k = t + (j == 0 ? 0 : j == 1 ? 32 : j == 2 ? 16 : j == 3 ? 8 : 24);
+            ed_g8* b = wr + (k >> 1) * 18;
+            q0[j] = ed_ld_b2(b + 2 + 8 * par);
+            q1[j] = ed_ld_b2(b + 6 + 8 * par);
+            dh[j] = ed_ld16(b);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            if constexpr (SW) sw_stage_ed<ED_HB, false, ED_NC>(s_u, s_ds, sw_gate, sw_up, e, n, tid);
+            else
+                for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, false>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
+            iq_sync_lds();
+            if (!valid_r) continue;
+            auto run = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+                S::W w[5];
+#pragma unroll
+                for (int j = 0; j < 5; ++j) {
+                    w[j].v[0] = ed_iq4nl_lut(q0[j], tab);
+                    w[j].v[1] = ed_iq4nl_lut(q1[j], tab);
+                    w[j].dw = __half2float(__ushort_as_half((unsigned short) dh[j]));
+                }
+                // acc + apply_u(...) as the kernel it replaces contracts it, one fma (d = dw * d8 its own product); written
+                // out, as a contraction it could split across the n cases' merged blocks and round twice
+                auto term = [&](int j, int c, float acc) -> float {
+                    const int k = t + (j == 0 ? 0 : j == 1 ? 32 : j == 2 ? 16 : j == 3 ? 8 : 24), kbx = k >> 1;
+                    const int2 p0 = s_p[(c * ED_HB + kbx) * 4 + par], p1 = s_p[(c * ED_HB + kbx) * 4 + 2 + par];
+                    int sumi = 0;
+                    sumi = ggml_cuda_dp4a(w[j].v[0].x, p0.x, sumi);
+                    sumi = ggml_cuda_dp4a(w[j].v[0].y, p1.x, sumi);
+                    sumi = ggml_cuda_dp4a(w[j].v[1].x, p0.y, sumi);
+                    sumi = ggml_cuda_dp4a(w[j].v[1].y, p1.y, sumi);
+                    const float d = __fmul_rn(w[j].dw, s_ds[c * ED_HB + kbx]);
+                    return __builtin_fmaf(d, (float) sumi, acc);
+                };
+                float s[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {   // row_dot_40_sub8's tree: (t + t32) + t16, then + (t8 + t24)
+                    s[c] = term(1, c, term(0, c, 0.0f));
+                    s[c] = __fadd_rn(s[c], term(2, c, 0.0f));
+                    s[c] = __fadd_rn(s[c], __fadd_rn(term(3, c, 0.0f), term(4, c, 0.0f)));
+                }
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+#pragma unroll
+                    for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (t == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c] * sd;
+            };
+            switch (n) {
+                case 1: run(std::integral_constant<int, 1>{}); break;
+                case 2: run(std::integral_constant<int, 2>{}); break;
+                case 3: run(std::integral_constant<int, 3>{}); break;
+                default: run(std::integral_constant<int, 4>{}); break;
+            }
+        }
+    }
+}
+#endif
+
 // R IQ4_NL down rows, lane t of an 8-lane sub-warp: row_dot_40_sub8's tree.  s_p: the block's 8 words together
 // (ed_stage_entry<ED_HB, false>), read as the int2 pairs (iqs, iqs + 1) and (iqs + 4, iqs + 5).
 template<int R, int NC>
@@ -4109,6 +4483,17 @@ int expdec_down_on() {
 int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
 int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
 int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
+int g_expdec_v2 = env_int_or("STRATA_EXPDEC_V2", 0);        // 1 (AMD): expdec_gu_v2_kernel (IQ2_S / IQ3_XXS gate/up, R 1, rb 16 / 32),
+                                                           // native_down_v2_kernel (IQ4_NL down at n_ff 640)
+// expdec_gu_r takes expdec_gu_v2_kernel for this format, rows per lane and rows per block
+bool expdec_gu_v2_on(int tg, int r, int rb) {
+#if defined(__HIPCC__)
+    return g_expdec_v2 && (tg == 22 || tg == 18) && r == 1 && (rb == 16 || rb == 32);   // (rb 64: 4 passes in registers spill)
+#else
+    (void) tg; (void) r; (void) rb;
+    return false;
+#endif
+}
 int expdec_r() { return g_expdec_r == 2 ? 2 : 1; }
 int expdec_dr() { return g_expdec_dr == 1 || g_expdec_dr == 2 ? g_expdec_dr : 4; }
 
@@ -4133,14 +4518,41 @@ int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
     return rb;
 }
 
+// expdec_gu_r's rows per block: STRATA_EXPDEC_V2's 16 for its formats (rb 32, its 2 passes, is the slower: the register
+// schedule goes serial), unless STRATA_EXPDEC_RB is given
+int expdec_gu_rb(int tg, int R, int nrow, int64_t cap_groups) {
+    if (g_expdec_v2 && g_expdec_rb <= 0 && expdec_gu_v2_on(tg, R, 16)) return 16;
+    return expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
+}
 template<int TG, int R, int MINB>
 void expdec_gu_r(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                  const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                  float* gate, float* up, block_q8_1* sw_hq, uint32_t* sw_cnt) {
     const int nrow = 2 * (int) L.n_ff;
-    const int rb = expdec_rows_per_block(nrow, 16 * R, cap_groups, g_expdec_rb);
+    const int rb = expdec_gu_rb(TG, R, nrow, cap_groups);
     const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
     const bool swe = sw_hq != nullptr && rb % 32 == 0 && L.n_ff % rb == 0;   // STRATA_FUSE_SWIGLU_GU (column chunks)
+#if defined(__HIPCC__)
+    if constexpr (R == 1 && (TG == 22 || TG == 18)) {
+        if (expdec_gu_v2_on(TG, R, rb)) {
+            const bool swe2 = sw_hq != nullptr && L.n_ff % 32 == 0;   // (rb 16 / 32: 32-column chunks)
+            auto v2 = [&](auto np) {
+                constexpr int NP = decltype(np)::value;
+                if (swe2)
+                    expdec_gu_v2_kernel<TG, NP, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
+                                                                           sw_hq, sw_cnt);
+                else
+                    expdec_gu_v2_kernel<TG, NP><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb);
+            };
+            if (rb == 16) v2(std::integral_constant<int, 1>{});
+            else v2(std::integral_constant<int, 2>{});
+            if (sw_hq != nullptr && !swe2)
+                swiglu_q8_1_entries_kernel<<<(unsigned) ((cap_groups * L.n_ff + 255) / 256), 256, 0, s>>>(
+                    gate, up, grp_start, n_groups, (int) L.n_ff, sw_hq);
+            return;
+        }
+    }
+#endif
     if (swe)
         expdec_gu_kernel<TG, R, MINB, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb,
                                                                  sw_hq, sw_cnt);
@@ -4183,9 +4595,13 @@ void expdec_note(const NativeExpertLayout& L, bool gu, bool taken, cudaStream_t 
         return;
     }
     if (gu) {
-        const int R = expdec_r(), rb = expdec_rows_per_block(2 * (int) L.n_ff, 16 * R, cap_groups, g_expdec_rb);
-        std::fprintf(stderr, "strata expdec: CUDA%d gate/up type %d: expdec_gu_kernel R %d MINB %d, %d rows per block, grid %d x %lld "
-                             "(cap %lld groups)%s\n", dev, ty, R, g_expdec_minb >= 4 ? 4 : 2, rb, (2 * (int) L.n_ff + rb - 1) / rb,
+        const int R = expdec_r(), rb = expdec_gu_rb(ty, R, 2 * (int) L.n_ff, cap_groups);
+        if (g_expdec_v2 && !expdec_gu_v2_on(ty, R, rb))
+            std::fprintf(stderr, "strata expdec: STRATA_EXPDEC_V2 not taken for gate/up type %d (R %d, %d rows per block): "
+                                 "expdec_gu_kernel runs\n", ty, R, rb);
+        std::fprintf(stderr, "strata expdec: CUDA%d gate/up type %d: %s R %d MINB %d, %d rows per block, grid %d x %lld "
+                             "(cap %lld groups)%s\n", dev, ty, expdec_gu_v2_on(ty, R, rb) ? "expdec_gu_v2_kernel" : "expdec_gu_kernel", R,
+                     g_expdec_minb >= 4 ? 4 : 2, rb, (2 * (int) L.n_ff + rb - 1) / rb,
                      (long long) gy, (long long) cap_groups, cs != cudaStreamCaptureStatusNone ? ", captured into a graph" : "");
     } else {
         const int R = expdec_dr(), lanes = ty == 20 ? 8 : 16;
@@ -5229,6 +5645,7 @@ void native_expert_set_expdec_params(const NativeExpertExpdecParams& p) {
     if (p.gu_rows_per_block >= 0) g_expdec_rb = p.gu_rows_per_block;
     if (p.down_rows_per_block >= 0) g_expdec_drb = p.down_rows_per_block;
     if (p.min_blocks > 0) g_expdec_minblk = p.min_blocks;
+    if (p.v2 >= 0) g_expdec_v2 = p.v2;
 }
 NativeExpertExpdecParams native_expert_expdec_params() {
     NativeExpertExpdecParams p;
@@ -5240,6 +5657,7 @@ NativeExpertExpdecParams native_expert_expdec_params() {
     p.gu_rows_per_block = g_expdec_rb;
     p.down_rows_per_block = g_expdec_drb;
     p.min_blocks = g_expdec_minblk;
+    p.v2 = g_expdec_v2;
     return p;
 }
 bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& down) {
@@ -5264,6 +5682,24 @@ bool fuse_sw_gu_on() {
 void native_expert_set_fuse_sw_gu(int on) { g_fuse_sw_gu = on < 0 ? -1 : (on ? 1 : 0); }
 bool native_expert_fuse_sw_gu() { return fuse_sw_gu_on(); }
 
+// STRATA_EXPDEC_V2's IQ4_NL down (native_expert_grouped's 32-row 8-lane down layout); one stderr line if it is on and
+// not taken
+bool native_down_v2_on(const NativeExpertLayout& L, int d_rows) {
+#if defined(__HIPCC__)
+    if (!g_expdec_v2 || L.d_type != 20) return false;
+    const bool on = L.n_ff == 32 * ED_HB && L.n_embd % 32 == 0 && d_rows == 32 && !g_old_kernels && !expdec_down_takes(L);
+    static bool said = false;
+    if (!on && !said)
+        std::fprintf(stderr, "strata expdec: STRATA_EXPDEC_V2 not taken for the IQ4_NL down (n_ff %lld, n_embd %lld, %d rows a "
+                             "block%s): the default kernel runs\n", (long long) L.n_ff, (long long) L.n_embd, d_rows,
+                     expdec_down_takes(L) ? ", expdec's down" : "");
+    said = said || !on;
+    return on;
+#else
+    (void) L; (void) d_rows;
+    return false;
+#endif
+}
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -5504,6 +5940,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
     } else
 #undef STRATA_D_AMD
+#endif
+#if defined(__HIPCC__)
+    // STRATA_EXPDEC_V2: native_down_v2_kernel for launch_down<20>'s kernel and the STRATA_FUSE_SWIGLU_DOWN one
+    if (native_down_v2_on(L, d_rows)) {
+        if (sw_down) native_down_v2_kernel<true><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);
+        else native_down_v2_kernel<false><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else
 #endif
     if (sw_down && !expdec_down_takes(L)) {   // STRATA_FUSE_SWIGLU_DOWN: launch_down<20>'s kernel, h staged from gate / up
         native_down_multi_kernel<20, true, false, true><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);

@@ -125,6 +125,7 @@ int native_expert_expdec();
 struct NativeExpertExpdecParams {
     int gu_rows_per_lane = 0, down_rows_per_lane = 0, gu_min_blocks_per_sm = 0, down_iq4_nl = -1, down = -1;
     int gu_rows_per_block = -1, down_rows_per_block = -1, min_blocks = 0;
+    int v2 = -1;   // STRATA_EXPDEC_V2
 };
 void native_expert_set_expdec_params(const NativeExpertExpdecParams& p);
 NativeExpertExpdecParams native_expert_expdec_params();
