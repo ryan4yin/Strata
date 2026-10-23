@@ -213,6 +213,55 @@ struct Setup {
     }
 };
 
+// STRATA_FUSE_SWIGLU_DOWN: the down kernel making h's q8_1 blocks itself against the SwiGLU + q8_1 launch before it,
+// with expdec (its down kernel) on and off: `out` bitwise, the rows the call must not write included
+void check_sw_down(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+    Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);
+    int calls = 0, bad = 0;
+    size_t written = 0;
+    int fused = 0;   // calls whose hq stayed the scratch's junk: the down kernel made h itself
+    auto out_of = [&](bool sw, int64_t gy, int junk) {
+        k::native_expert_set_fuse_sw_down(sw ? 1 : 0);
+        auto o = S.result(false, gy, junk, s);
+        k::native_expert_set_fuse_sw_down(-1);
+        if (sw && o.size() > S.out_floats) {
+            const uint32_t j = (uint32_t) (junk & 0xFF) * 0x01010101u;
+            bool untouched = true;
+            for (size_t i = S.out_floats; i < o.size(); ++i) untouched = untouched && o[i] == j;
+            fused += untouched;
+        }
+        o.resize(S.out_floats);   // the fused call writes no hq: `out` only
+        return o;
+    };
+    for (const int ed : {1, 0}) {
+        k::native_expert_set_expdec(ed);
+        for (const int base : {0, 7}) {
+            for (const int groups : {0, 1, 2, 3, 5, 8, 24}) {
+                const int ng = S.plan(groups, base, rng);
+                for (const int64_t gy : {(int64_t) 0, (int64_t) 4}) {
+                    const auto ref = out_of(false, gy, 0x00);
+                    for (size_t i = 0; i < ref.size(); ++i) written += ref[i] != 0xFFFFFFFFu;
+                    const auto got = out_of(true, gy, (calls & 1) ? 0x7F : 0x00);
+                    ++calls;
+                    size_t diff = 0;
+                    for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
+                    if (diff) {
+                        std::printf("  %-8s/%-7s expdec %d base %d, %d groups, grid_groups %lld: %zu of %zu output words differ  FAIL\n",
+                                    name_of(gu), name_of(dt), ed, base, ng, (long long) gy, diff, ref.size());
+                        ++bad;
+                    }
+                }
+            }
+        }
+        k::native_expert_set_expdec(-1);
+    }
+    std::printf("%-8s/%-7s %5lld x %4lld  %d calls (%d of them fused): %s (%zu output floats written in all)\n",
+                name_of(gu), name_of(dt), (long long) H, (long long) FF, calls, fused,
+                bad ? "FAIL" : "STRATA_FUSE_SWIGLU_DOWN bitwise equal", written);
+    if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
+    g_fail += bad;
+}
+
 void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
@@ -362,6 +411,10 @@ int main(int argc, char** argv) {
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    // STRATA_FUSE_SWIGLU_DOWN: the model's down shapes (IQ4_NL / Q2_0 at 2560 x 640) under each i-quant gate/up
+    for (int gu : {16, 17, 18, 21, 22})
+        for (int dt : {20, 42}) check_sw_down(gu, dt, 2560, 640, s, rng);
+    check_sw_down(21, 23, 2560, 768, s, rng);   // not fused (IQ4_XS down): the launches as before
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);
