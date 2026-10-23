@@ -164,6 +164,17 @@ bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const v
 /// exact native_mmvq_multi_kernel<F, n, 4, 2>; bitwise the two calls.  false: nothing launched.
 bool native_mmvq_pair_mixed(int type1, int type2, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                             int n_in, int n_out, int ncols, void* stream);
+/// STRATA_FUSE_PROJ=1 (native_mmvq_proj_on(); HIP): native_mmvq(seg.type, seg.w -> seg.y, n_in, seg.n_out, ncols) for
+/// 2-4 matrices of one input in one launch, bitwise those calls.  So far Q6_K only, 1-4 columns (every segment's rows
+/// by q6k_v2_kernel's code).  false: nothing launched (the caller makes the calls).
+struct MmvqSeg {
+    int type;
+    const void* w;
+    float* y;
+    int n_out;
+};
+bool native_mmvq_proj_on();
+bool native_mmvq_proj(const MmvqSeg* segs, int n_segs, const void* x_q8_1, int n_in, int ncols, void* stream);
 
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
