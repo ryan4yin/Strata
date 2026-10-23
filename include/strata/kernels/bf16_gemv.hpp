@@ -65,6 +65,12 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 /// S26 STRATA_LFUSE: bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) plus the 1-row
 /// bf16_gemv_fp32_mmvf_multi(x, ldx, w_aux, y_aux, ldy_aux, n_in, 1, n_tok) in ONE launch, every output bitwise the
 /// two calls'. Returns false (nothing launched) unless the rows path applies (STRATA_MMVF_ROWS=1, n_out >= 64, 2-8 rows).
+/// fuse-gdn (STRATA_FUSE_IDXPAIR): bf16_gemv_fp32_mmvf_multi(x, ldx, w1, y1, ldy1, n_in, n_out1, n_tok) and the same
+/// with w2 / y2 / ldy2 / n_out2 in ONE launch, every output bitwise the two calls'.  Returns false (nothing launched)
+/// unless both would take the rows kernel without STRATA_TSUM (STRATA_MMVF_ROWS=1, n_out >= 64, 2-8 rows).
+bool bf16_gemv_fp32_mmvf_multi_pair(const float* x, int64_t ldx, const uint16_t* w1, float* y1, int64_t ldy1,
+                                    int64_t n_out1, const uint16_t* w2, float* y2, int64_t ldy2, int64_t n_out2,
+                                    int64_t n_in, int n_tok, void* stream);
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream);
