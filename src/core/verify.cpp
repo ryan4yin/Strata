@@ -487,6 +487,14 @@ bool fuse_combine_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_COMBINE"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_FUSE_SHGATE=1 (with STRATA_FUSE_COMBINE, outside the all-resident path): the shared expert's gate row rides in
+// the router's GEMV launch (bf16_gemv_fp32_mmvf_multi_aux) and its sigmoid + row scale in that combine
+// (native_moe_combine_multi_hits_mapped's shared_gate), as STRATA_LFUSE does on the all-resident path: two kernel nodes
+// fewer per layer and group.  Opt-in.
+bool fuse_shgate_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHGATE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 
 // 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
 bool fuse_convab_on() {
@@ -1343,6 +1351,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
+    // STRATA_FUSE_COMBINE: post() folds the CPU share's wait + copy into the hits-added combine (the same conditions in
+    // pre(), which defers the shared gate to that combine under STRATA_FUSE_SHGATE)
+    auto comb_fusable = [&](int n, int tb) {
+        return fuse_combine_on() && fuse_hits_on() && !prof_on_ && !remote_opt_ && !ar_on() && dec_batch && n > 1 && n <= 8 &&
+               native_moe_combine_enabled() && m_bal_ == nullptr && (device_plan_ || fuse_rows_on()) &&
+               native_moe_combine_hits_supported(m_ymiss_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+    };
+    auto shgate_on = [&](int n, int tb) {
+        return fuse_shgate_on() && comb_fusable(n, tb) && shared_expert_native_bf16_enabled();
+    };
     if (!batch_rec_) groups_[T] = G;
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
@@ -2252,7 +2270,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+        const WeightRef* w_sgi = (lfuse_on(n) && g_lfuse_gate()) || shgate_on(n, tb) ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
@@ -2485,10 +2503,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             grouped(p_ptr2_use, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
             stamp(l, 22, grp);
             // STRATA_FUSE_COMBINE: the hits-added combine below waits for the CPU's rows and reads them where they are
-            fuse_comb = fuse_combine_on() && fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch &&
-                        n > 1 && n <= 8 && native_moe_combine_enabled() && m_bal_ == nullptr &&
-                        (device_plan_ || fuse_rows_on()) &&
-                        native_moe_combine_hits_supported(m_ymiss_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
+            fuse_comb = comb_fusable(n, tb);
             if (fuse_comb) {
                 stamp(l, 23, grp);
                 hits_in_combine = true;
@@ -2529,16 +2544,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
-        if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
-            try {
-                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
-            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
-        } else
-        if (fuse_comb) {
+        if (sg_gated_[grp] && !ar_on() && !fuse_comb) {   // STRATA_FUSE_SHGATE defers the gate only to that combine
+            err = "verify: the shared gate was deferred to a combine that did not run";
+            return false;
+        }
+        if (fuse_comb) {   // STRATA_FUSE_COMBINE (+ STRATA_FUSE_SHGATE: the shared gate applied here)
             try {
                 native_moe_combine_multi_hits_mapped(m_ymiss_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                      shared_ + tb * N, bo_ + tb * N, N, K, n, m_flag_, ring,
-                                                     device_plan_ ? skip_ + grp : nullptr, nullptr, cs);
+                                                     device_plan_ ? skip_ + grp : nullptr, sg_gated_[grp] ? sh_g_ + tb : nullptr, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
+            try {
+                native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {
