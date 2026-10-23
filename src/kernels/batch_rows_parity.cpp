@@ -13,8 +13,13 @@
 //      window (history read only) and the 1-row self-commit (history written).
 //   6. STRATA_FUSE_IDXAPP: native_qsa_indexer_append_slots == per slot group the tail snapshot (copy_from_mapped) and
 //      one native_qsa_indexer_append per row (positions at the window's kStepCount stride).
+//   7. STRATA_FUSE_ATTNMERGE: per row qsa_decode_attn_batch_chunks, then one qsa_decode_attn_batch_merge over the rows ==
+//      qsa_decode_attn_batch per row (in attn_case); STRATA_FUSE_KVROWS: kv_append_q8_rows == kv_append_q8_step per row,
+//      each row its own pools, page table (non-resident pages) and host copy.
 // Every case compares with memcmp, not a tolerance. Usage: batch_rows_parity
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -198,6 +203,24 @@ void attn_case(int rows, bool int8) {
         k::qsa_decode_attn_batch(d_q + (size_t) r * NH * HD, pr.p[r], d_ids + (size_t) r * cap, d_steps + (size_t) r * k::kStepCount, cap,
                                  s, scratch + (size_t) r * scr, d_ref + (size_t) r * NH * HD, 1, nullptr);
     ck(cudaDeviceSynchronize(), "sync");
+    {   // STRATA_FUSE_ATTNMERGE: each row's chunk pass alone, then one merge over every row's partials
+        float *scratch2 = nullptr, *d_late = nullptr;
+        ck(cudaMalloc(&scratch2, (size_t) rows * scr * 4), "malloc");
+        ck(cudaMalloc(&d_late, n * 4), "malloc");
+        ck(cudaMemset(d_late, 0, n * 4), "memset");
+        for (int r = 0; r < rows; ++r)
+            k::qsa_decode_attn_batch_chunks(d_q + (size_t) r * NH * HD, pr.p[r], d_ids + (size_t) r * cap,
+                                            d_steps + (size_t) r * k::kStepCount, cap, s, scratch2 + (size_t) r * scr, 1,
+                                            nullptr);
+        k::qsa_decode_attn_batch_merge(d_steps, cap, s, scratch2, d_late, rows, nullptr);
+        ck(cudaDeviceSynchronize(), "sync");
+        const std::vector<float> a = down(d_late, n), b = down(d_ref, n);
+        char nm[96];
+        std::snprintf(nm, sizeof nm, "attn chunks per row + one merge, %d rows, %s pools", rows, int8 ? "int8" : "fp16");
+        report(nm, std::memcmp(a.data(), b.data(), n * 4) == 0);
+        cudaFree(scratch2);
+        cudaFree(d_late);
+    }
     const std::vector<float> a = down(d_rows, n), b = down(d_ref, n);
     char name[96];
     std::snprintf(name, sizeof name, "qsa_decode_attn_batch_rows, %d rows, %s pools (own pools each)", rows, int8 ? "int8" : "fp16");
@@ -532,6 +555,77 @@ void idx_slots_case(const std::vector<int>& ntok, const std::vector<int32_t>& po
     std::snprintf(name, sizeof name, "indexer append_slots%s, rows@pos %s", snap ? " + snapshot" : "", rows);
     report(name, same);
 }
+// ---- 7b. the window's int8 K/V cells of every row in one launch (STRATA_FUSE_KVROWS) ----
+void kvrows_case(int rows, bool mirror) {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int64_t HD = s.head_dim, NKV = s.n_head_kv, PS = s.page_size, G = HD / k::KV_Q8_GROUP;
+    const int64_t blocks = 40, slots = 24, vrow = slots * NKV * PS, hrow = blocks * NKV * PS;   // fewer VRAM slots than blocks
+    std::mt19937 rng(201 + rows * 2 + mirror);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> kc((size_t) rows * NKV * HD), vc(kc.size());
+    for (auto& x : kc) x = nd(rng) * 3.0f;
+    for (auto& x : vc) x = nd(rng);
+    for (int64_t i = 0; i < NKV * HD; i += 97) kc[(size_t) i] = 0.0f;   // a few zeros, and an all-zero group in row 0
+    for (int64_t i = 0; i < k::KV_Q8_GROUP; ++i) vc[(size_t) i] = 0.0f;
+    std::vector<int32_t> steps((size_t) rows * k::kStepCount, -3);
+    struct Pools { int8_t *kq, *vq; uint16_t *ks, *vs; int32_t* table; k::KvHostPools h; };
+    auto alloc = [&](int64_t nrow) {
+        Pools p{};
+        std::vector<int8_t> z8((size_t) nrow * HD, 5);
+        std::vector<uint16_t> z16((size_t) nrow * G, 7);
+        p.kq = up(z8); p.vq = up(z8); p.ks = up(z16); p.vs = up(z16);
+        return p;
+    };
+    std::vector<Pools> ref, fus;
+    k::KvQ8Rows kr;
+    kr.n = rows;
+    for (int r = 0; r < rows; ++r) {
+        std::vector<int32_t> table((size_t) blocks, -1);
+        for (int64_t b = 0; b < blocks; ++b) if (rng() % 3 != 0) table[(size_t) b] = (int32_t) (rng() % slots);
+        const int32_t pos = (int32_t) (rng() % (blocks * PS));
+        if (r == 0) table[(size_t) (pos / PS)] = 3;            // row 0's block resident, row 1's (if any) not
+        if (r == 1) table[(size_t) (pos / PS)] = -1;
+        steps[(size_t) r * k::kStepCount + k::kStepPos] = pos;
+        for (Pools* side : {&ref.emplace_back(alloc(vrow)), &fus.emplace_back(alloc(vrow))}) {
+            side->table = up(table);
+            if (mirror && r != 2) {   // row 2 has no host copy
+                const Pools hp = alloc(hrow);
+                side->h.k_q = hp.kq; side->h.v_q = hp.vq; side->h.k_scale = hp.ks; side->h.v_scale = hp.vs;
+            }
+        }
+        kr.k_q[r] = fus.back().kq; kr.v_q[r] = fus.back().vq; kr.k_scale[r] = fus.back().ks; kr.v_scale[r] = fus.back().vs;
+        kr.table[r] = fus.back().table; kr.host[r] = fus.back().h;
+    }
+    const int32_t* d_steps = up(steps);
+    const float *d_k = up(kc), *d_v = up(vc);
+    for (int r = 0; r < rows; ++r) {
+        const Pools& p = ref[(size_t) r];
+        k::kv_append_q8_step(p.kq, p.vq, p.ks, p.vs, p.table, d_steps + (size_t) r * k::kStepCount, d_k + (size_t) r * NKV * HD,
+                             d_v + (size_t) r * NKV * HD, s, nullptr, p.h.present() ? &p.h : nullptr);
+    }
+    k::kv_append_q8_rows(kr, d_steps, (int) k::kStepCount, d_k, d_v, (int) (NKV * HD), s, nullptr);
+    ck(cudaDeviceSynchronize(), "sync");
+    auto eq8 = [](const int8_t* a, const int8_t* b, int64_t n) {
+        const std::vector<int8_t> x = down(a, (size_t) n), y = down(b, (size_t) n);
+        return std::memcmp(x.data(), y.data(), (size_t) n) == 0;
+    };
+    auto eq16 = [](const uint16_t* a, const uint16_t* b, int64_t n) {
+        const std::vector<uint16_t> x = down(a, (size_t) n), y = down(b, (size_t) n);
+        return std::memcmp(x.data(), y.data(), (size_t) n * 2) == 0;
+    };
+    bool same = true;
+    for (int r = 0; r < rows; ++r) {
+        const Pools &a = ref[(size_t) r], &b = fus[(size_t) r];
+        same = same && eq8(a.kq, b.kq, vrow * HD) && eq8(a.vq, b.vq, vrow * HD) && eq16(a.ks, b.ks, vrow * G) &&
+               eq16(a.vs, b.vs, vrow * G);
+        if (a.h.present())
+            same = same && eq8(a.h.k_q, b.h.k_q, hrow * HD) && eq8(a.h.v_q, b.h.v_q, hrow * HD) &&
+                   eq16(a.h.k_scale, b.h.k_scale, hrow * G) && eq16(a.h.v_scale, b.h.v_scale, hrow * G);
+    }
+    char name[96];
+    std::snprintf(name, sizeof name, "kv_append_q8_rows, %d rows%s", rows, mirror ? " (host copies, non-resident pages)" : "");
+    report(name, same);
+}
 }  // namespace
 
 int main() {
@@ -575,6 +669,8 @@ int main() {
         idx_slots_case({1, 3, 2}, {11, 29, 30, 31, 14, -1}, snap);
         idx_slots_case({4, 4}, {200, 201, 202, 203, 33, 34, 35, 36}, snap);
     }
+    for (const bool mirror : {false, true})
+        for (int r : {1, 2, 4, 8}) kvrows_case(r, mirror);
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;
 }
