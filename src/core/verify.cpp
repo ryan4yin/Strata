@@ -578,6 +578,13 @@ bool fuse_gatemerge_on() {
     return on;
 }
 
+// fuse-gdn: STRATA_FUSE_IDXPAIR=1 - a QSA layer's indexer key and indexer query projections (bf16, both of the mixer
+// input) in one launch (bf16_gemv_fp32_mmvf_multi_pair) where the key's is made; the query's chain skips its own
+bool fuse_idxpair_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_IDXPAIR"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // fuse-gdn: STRATA_FUSE_GATEMERGE_Q8=1 (with STRATA_FUSE_GATEMERGE=1) - that merge also writes the out projection's q8_1
 // input (qsa_decode_attn_batch_merge_gate's xq_out) instead of a quantize launch after it
 bool fuse_gatemerge_q8_on() {
@@ -1913,7 +1920,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope_on(data, norm, rows, cols, pos, ns);
                 };
+                bool idx_paired = false;   // STRATA_FUSE_IDXPAIR: idx_key wrote qidx_'s projection too
                 auto idx_key = [&](cudaStream_t ns) {
+                    if (qb && ns == cs && !sidem && !qbr && fuse_idxpair_on())
+                        idx_paired = bf16_gemv_fp32_mmvf_multi_pair(mixed_ + tb * N, N, (const uint16_t*) wik->data,
+                                                                    idx_raw + tb * ID, ID, ID, (const uint16_t*) wiq->data,
+                                                                    qidx_ + tb * IQ * ID, IQ * ID, IQ * ID, N, n, ns);
+                    if (idx_paired) return;
                     if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, ns);
                     else for (int t = tb; t < te; ++t)
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
@@ -1971,6 +1984,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 auto idx_query = [&](cudaStream_t ns) {
                     if (qb) {
+                        if (!idx_paired)
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                                   N, IQ * ID, n, ns);
                         norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
@@ -2062,6 +2076,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  native_norm_rope_usable((int) ID, (int) s.n_rot);
                 if (nr3) {
                     mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));   // q_chain's projection
+                    if (!idx_paired)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);                          // idx_query's
                     NormRopeSegs sg;
