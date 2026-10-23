@@ -1234,6 +1234,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(b6_mmvq_bench src/kernels/b6_mmvq_bench.cpp)
   target_include_directories(b6_mmvq_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(b6_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(shexp_bench src/kernels/shexp_bench.cpp)
+  if(STRATA_ENABLE_HIP)
+    set_source_files_properties(src/kernels/shexp_bench.cpp PROPERTIES LANGUAGE HIP)
+  endif()
+  target_include_directories(shexp_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(shexp_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # fork: the Daily's decode attention (STRATA_ATTN_DAILY=1: PR #540's chunk kernel on every card and the bounded
   # merge) against upstream's kernels, bitwise; the production entries checked with the variable off and on
   add_executable(qsa_merge_daily_parity src/kernels/qsa_merge_daily_parity.cpp)
