@@ -1688,6 +1688,7 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
     const int64_t HCN = HC * N;
     MtpDrafter* const ds[2] = {this, &peer};
     static const bool gr_fuse = [] { const char* v = std::getenv("STRATA_FUSE_DRAFTPAIR_GR"); return v != nullptr && v[0] == '1'; }();
+    static const bool expert_fuse = [] { const char* v = std::getenv("STRATA_FUSE_DRAFTPAIR_EXPERT"); return v != nullptr && v[0] == '1'; }();
     try {
         // ---- the two selected rows: R, injection and the MLP input, one gather kernel
         mtp_pair_pick_rows(row_, peer.row_, R_, R_ + 2 * HCN, hn_, HCN, inj_, inj_ + 2 * HC, h2_, HC,
@@ -1775,7 +1776,12 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
         }
         if (!q8_mlp) native_quantize_q8_1(mixed_, xq_, (int) N, 2, cs);
         // ---- router: one multi-row GEMV and one top-10 pass when _EXPERT is on
-                    for (int t = 0; t < 2; ++t) {
+        if (expert_fuse) {
+            bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N, (int) g.n_expert,
+                                      2, cs);
+            native_router_top10_multi(logits_, ids_, w_, 2, cs);
+        } else {
+            for (int t = 0; t < 2; ++t) {
                 bf16_gemv_fp32_mmvf(mixed_ + (size_t) t * N, bf16("mlp.gate.weight"), logits_ + (size_t) t * g.n_expert,
                                     (int) N, (int) g.n_expert, cs);
                 if (native_router_enabled() && g.n_expert == 512 && K == 10)
@@ -1784,7 +1790,7 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
                     router_top10(logits_ + (size_t) t * g.n_expert, 1, (int) g.n_expert, (int) K,
                                  ids_ + (size_t) t * K, w_ + (size_t) t * K, cs);
             }
-
+        }
         if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
             // pair_ok declines routed-resident drafters; this is a guard for a future caller.
             err = "mtp pair: routed-resident MTP is not paired";
@@ -1796,7 +1802,14 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
         nsw.down_data = wq("mlp.shared_expert.down_proj.weight", nsw.down_type);
         nsw.q8_1 = xq_;
         nsw.x_q8_1 = q8_mlp ? (const void*) xq_ : nullptr;
-                    for (int t = 0; t < 2; ++t) {
+        if (expert_fuse) {
+            moe_group_resident(ids_, (int) (2 * K), (int) K, experts_, (int64_t) cpu::BLOB, grp_ptr_, grp_start_,
+                               grp_counts_, hit_dst_, hit_slot_, cs);
+            quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) 2 * N, cs);
+            moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) (2 * K),
+                           (int64_t) (2 * K), hit_xq_, hit_xs_, hit_scratch_, parts_, cs);
+        } else {
+            for (int t = 0; t < 2; ++t) {
                 moe_group_resident(ids_ + (size_t) t * K, (int) K, (int) K, experts_, (int64_t) cpu::BLOB, grp_ptr_,
                                    grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
                 quantize_q8_0_scaled(mixed_ + (size_t) t * N, hit_xq_ + (size_t) t * (N / 32) * 34,
@@ -1805,10 +1818,17 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
                                hit_xq_ + (size_t) t * (N / 32) * 34, hit_xs_ + (size_t) t * (N / 32), hit_scratch_,
                                parts_ + (size_t) t * K * N, cs);
             }
-
+        }
         // ---- shared expert: one multi-row read over both slots (same weights, every token bitwise its own call)
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
-                    for (int t = 0; t < 2; ++t) {
+        if (expert_fuse) {
+            nsw.q8_1 = xq_;
+            nsw.x_q8_1 = q8_mlp ? (const void*) xq_ : nullptr;
+            if (need_bf16_x) f32_to_bf16_bulk(mixed_, x_bf16_, (int64_t) 2 * N, cs);
+            shared_expert_multi(2, mixed_, x_bf16_, nsw, bf16("mlp.shared_expert_gate.weight"), sh_gate2_, sh_up2_,
+                                sh_g2_, shared_, N, g.n_ff, cs);
+        } else {
+            for (int t = 0; t < 2; ++t) {
                 if (need_bf16_x) f32_to_bf16_bulk(mixed_ + (size_t) t * N, x_bf16_, N, cs);
                 NativeSharedWeights nt = nsw;
                 if (q8_mlp) nt.x_q8_1 = xq_ + (size_t) t * (N / 32) * 36;
@@ -1816,7 +1836,7 @@ bool MtpDrafter::pair_round_rest(int T_own, int T_peer, MtpDrafter& peer, cudaSt
                               nullptr, SForm{}, nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_,
                               shared_ + (size_t) t * N, N, g.n_ff, 32, cs, mixed_ + (size_t) t * N, &nt);
             }
-
+        }
         native_moe_combine_multi(parts_, w_, shared_, y_, N, K, 2, cs);
         gr_write_multi(hn_, y_, inj2_, gs, hn_, 2, cs);
         // ---- final mixer: one shared-weight read over both rows, writing the head's q8_1 input rows 0 and 1
