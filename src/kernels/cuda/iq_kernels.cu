@@ -2229,14 +2229,75 @@ __device__ __forceinline__ void row_dot_sub8(const uint8_t* row, const block_q8_
     else row_dot_40_sub8<TD, NC, EXACT_N, STAGE_GRID>(row, x, off, n, t, s, s_grid);
 }
 
-// native_down_kernel with the entries taken GRP_NC at a time
-template<int TD, bool SUB_DOWN = true, bool STAGE_TQ = false>
+// STRATA_FUSE_SWIGLU_DOWN: the down kernels make the q8_1 h of the entries they stage themselves, from gate / up, instead
+// of reading what swiglu_q8_1_entries_kernel wrote.  Value i = (entry, column) is that kernel's: the same SwiGLU
+// expression with contraction off (the product rounded on its own), then q8_1_store's block (the same XOR-tree max and
+// sum over the 32 lanes of the block, d, the quantized value and ds).  A warp makes one block; 256 threads, 8 warps.
+// sw_q8_1_value: lane's h and its block's q / ds (the whole warp calls it, one q8_1 block of 32 consecutive values)
+__device__ __forceinline__ void sw_q8_1_value(const float* __restrict__ gate, const float* __restrict__ up, long long i,
+                                              int8_t& q, half2& ds) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    const float g = gate[i];
+#if defined(__HIPCC__)
+    const float xi = (g / (1.0f + __expf(-g))) * up[i];
+#else
+    const float xi = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+#endif
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = q8_1_finite(amax / 127.0f);
+    q = q8_1_quant(xi, d, amax);
+    ds = q8_1_ds(d, sum);
+}
+// n entries from e (HB = n_ff / 32 blocks each) as raw q8_1 blocks: s_hq[c * HB + k], what native_down_multi_kernel's
+// staging copied from hq + e * HB
+template<int HB>
+__device__ __forceinline__ void sw_stage_blocks(block_q8_1* s_hq, const float* __restrict__ gate, const float* __restrict__ up,
+                                                int e, int n, int tid) {
+    const int warp = tid >> 5, lane = tid & 31;
+    for (int idx = warp; idx < n * HB; idx += 8) {
+        const int c = idx / HB, k = idx - c * HB;
+        int8_t q;
+        half2 ds;
+        sw_q8_1_value(gate, up, (long long) (e + c) * (HB * 32) + k * 32 + lane, q, ds);
+        s_hq[idx].qs[lane] = q;
+        if (lane == 0) s_hq[idx].ds = ds;
+    }
+}
+// the same for expdec_down_kernel's layout (ed_stage_entry<XB, HALVES> of each entry): the quantized bytes in their
+// planes of s_u and s_ds[c XB + k] = __low2float(ds)
+template<int XB, bool HALVES>
+__device__ __forceinline__ void sw_stage_ed(int4* s_u, float* s_ds, const float* __restrict__ gate, const float* __restrict__ up,
+                                            int e, int n, int tid) {
+    const int warp = tid >> 5, lane = tid & 31;
+    int8_t* b = reinterpret_cast<int8_t*>(s_u);
+    for (int idx = warp; idx < n * XB; idx += 8) {
+        const int c = idx / XB, k = idx - c * XB;
+        int8_t q;
+        half2 ds;
+        sw_q8_1_value(gate, up, (long long) (e + c) * (XB * 32) + k * 32 + lane, q, ds);
+        if constexpr (HALVES) b[((c * 2 + (lane >> 4)) * XB + k) * 16 + (lane & 15)] = q;
+        else b[(c * XB + k) * 32 + lane] = q;
+        if (lane == 0) s_ds[c * XB + k] = __low2float(ds);
+    }
+}
+
+// native_down_kernel with the entries taken GRP_NC at a time.  SW (STRATA_FUSE_SWIGLU_DOWN; the IQ4_NL / NVFP4 8-lane
+// rows at n_ff 640 only): the staged activations are made from gate / up (sw_stage_blocks), hq is not read.
+template<int TD, bool SUB_DOWN = true, bool STAGE_TQ = false, bool SW = false>
 __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                 const int32_t* __restrict__ grp_start,
                                                                 const int32_t* __restrict__ n_groups,
                                                                 const int32_t* __restrict__ ent_dst,
                                                                 const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                                float* __restrict__ out) {
+                                                                float* __restrict__ out, const float* __restrict__ sw_gate = nullptr,
+                                                                const float* __restrict__ sw_up = nullptr) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TD, STAGE_TQ>::value);   // the trellis codebook on a cc 6.0 card, else 4 unused words
@@ -2305,10 +2366,14 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
                 const int e0 = grp_start[g], e1 = grp_start[g + 1];
                 for (int e = e0; e < e1; e += GRP_NC) {
                     const int n = min(GRP_NC, e1 - e);
+                    if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+                    if constexpr (SW) {
+                        sw_stage_blocks<20>(reinterpret_cast<block_q8_1*>(s_hq_buf), sw_gate, sw_up, e, n, threadIdx.x);
+                    } else {
                     const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
                     const int words = n * (20 * 9);
-                    if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
                     for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+                    }
                     iq_sync_lds();
                     if (valid_r) {
                         if (n == 1) {
@@ -2759,13 +2824,16 @@ __device__ __forceinline__ void ed_d42_rows(const uint8_t* const* wr, const int4
 
 // down (IQ4_NL: 32 sub-warps of 8 lanes; Q2_0: 16 of 16), R rows per lane, `rb` rows per block (a multiple of the
 // rows per pass; n_embd too).  The entries' h rows are contiguous in hq (entry e at e * ED_HB).
-template<int TD, int R>
+// SW (STRATA_FUSE_SWIGLU_DOWN): the staged activations are made from gate / up (sw_stage_ed), hq is not read.
+template<int TD, int R, bool SW = false>
 __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                                               const int32_t* __restrict__ grp_start,
                                                                               const int32_t* __restrict__ n_groups,
                                                                               const int32_t* __restrict__ ent_dst,
                                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                                              float* __restrict__ out, int rb) {
+                                                                              float* __restrict__ out, int rb,
+                                                                              const float* __restrict__ sw_gate = nullptr,
+                                                                              const float* __restrict__ sw_up = nullptr) {
     const int ng = *n_groups;
     if (blockIdx.y >= ng) return;
     constexpr int LANES = TD == 20 ? 8 : 16;
@@ -2782,6 +2850,8 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
         for (int e = e0; e < e1; e += ED_NC) {
             const int n = min(ED_NC, e1 - e);
             if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            if constexpr (SW) sw_stage_ed<ED_HB, TD == 42>(s_u, s_ds, sw_gate, sw_up, e, n, tid);
+            else
             for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, TD == 42>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
             iq_sync_lds();
             for (int p = 0; p * RPP < rb; ++p) {
@@ -4214,29 +4284,37 @@ bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cuda
 }
 template<int TD, int R>
 void expdec_down_r(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out,
+                   const float* sw_gate, const float* sw_up) {
     constexpr int LANES = TD == 20 ? 8 : 16;
     const int nrow = (int) L.n_embd;
     const int rb = expdec_rows_per_block(nrow, (256 / LANES) * R, cap_groups, g_expdec_drb);
     const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
+    if (sw_gate != nullptr)   // STRATA_FUSE_SWIGLU_DOWN
+        expdec_down_kernel<TD, R, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb, sw_gate, sw_up);
+    else
     expdec_down_kernel<TD, R><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb);
 }
 template<int TD>
 void expdec_down_t(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+                   const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out,
+                   const float* sw_gate, const float* sw_up) {
     switch (expdec_dr()) {
-        case 1: expdec_down_r<TD, 1>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 2: expdec_down_r<TD, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        default: expdec_down_r<TD, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 1: expdec_down_r<TD, 1>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sw_gate, sw_up); break;
+        case 2: expdec_down_r<TD, 2>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sw_gate, sw_up); break;
+        default: expdec_down_r<TD, 4>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sw_gate, sw_up); break;
     }
 }
+// expdec_down below takes this layer's down
+bool expdec_down_takes(const NativeExpertLayout& L) { return expdec_mode() && !g_old_kernels && expdec_down_ok(L); }
 bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
-                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, float* out) {
+                 const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, float* out,
+                 const float* sw_gate = nullptr, const float* sw_up = nullptr) {
     if (!expdec_mode() || g_old_kernels) return false;
     if (!expdec_down_ok(L)) { expdec_note(L, false, false, s, gy, cap_groups); return false; }
     expdec_note(L, false, true, s, gy, cap_groups);
-    if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-    else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sw_gate, sw_up);
+    else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, sw_gate, sw_up);
     return true;
 }
 
@@ -6291,6 +6369,14 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+// STRATA_FUSE_SWIGLU_DOWN=1 (opt-in): the down kernel stages the SwiGLU + q8_1 of gate / up itself (sw_stage_blocks)
+int g_fuse_sw_down = -1;   // native_expert_set_fuse_sw_down; -1: the environment's
+bool fuse_sw_down_on() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_FUSE_SWIGLU_DOWN"); return v != nullptr && std::atoi(v) != 0; }();
+    return g_fuse_sw_down >= 0 ? g_fuse_sw_down != 0 : env;
+}
+void native_expert_set_fuse_sw_down(int on) { g_fuse_sw_down = on < 0 ? -1 : (on ? 1 : 0); }
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -6414,6 +6500,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         }
         if (gs_done) check("native_expert_grouped/gu+swiglu");
     }
+    // STRATA_FUSE_SWIGLU_DOWN: the down launch below makes h's q8_1 blocks itself (where it is expdec_down_kernel, or
+    // native_down_multi_kernel's IQ4_NL 8-lane rows at n_ff 640), so the SwiGLU + q8_1 launch is left out (not with the
+    // separate passes of v1, gfx906 or a Hadamard-folded down)
+#if STRATA_EXP_LAYOUTS
+    const bool sw_down = false;
+#else
+    const bool sw_down = !gs_done && !v1 && L.had_block == 0 && g_exp_phase == 0 && fuse_sw_down_on() &&
+                         (expdec_down_takes(L) ||
+                          (L.d_type == 20 && L.n_ff == 640 && !g_old_kernels && !split_off<20>() && !g_no_sub16_gu));
+#endif
 #if STRATA_EXP_LAYOUTS
     if (g_exp_phase != 2 && !fused_gu && !gs_done) {
 #else
@@ -6477,7 +6573,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (sw_v1 || L.had_block > 0) {
+    if (sw_down) {
+    } else if (sw_v1 || L.had_block > 0) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);
@@ -6529,7 +6626,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else
 #undef STRATA_D_AMD
 #endif
-    if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out))   // STRATA_EXPDEC=1
+    if (sw_down && !expdec_down_takes(L)) {   // STRATA_FUSE_SWIGLU_DOWN: launch_down<20>'s kernel, h staged from gate / up
+        native_down_multi_kernel<20, true, false, true><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, gate, up);
+    } else
+    if (!expdec_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out, sw_down ? gate : nullptr,
+                     sw_down ? up : nullptr))   // STRATA_EXPDEC=1
     switch (L.d_type) {
 #define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         STRATA_D_FMTS(STRATA_DOWN)
