@@ -16,10 +16,13 @@
 //   7. STRATA_FUSE_ATTNMERGE: per row qsa_decode_attn_batch_chunks, then one qsa_decode_attn_batch_merge over the rows ==
 //      qsa_decode_attn_batch per row (in attn_case); STRATA_FUSE_KVROWS: kv_append_q8_rows == kv_append_q8_step per row,
 //      each row its own pools, page table (non-resident pages) and host copy.
+//   8. STRATA_FUSE_NR3: native_qsa_rms_norm_rope_segs (K in place, the query out of its q|gate rows, the indexer
+//      query in place) == the three native_qsa_rms_norm_rope calls.
 // Every case compares with memcmp, not a tolerance. Usage: batch_rows_parity
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_stream.hpp"
+#include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -643,6 +646,53 @@ void kvrows_case(int rows, bool mirror) {
     std::snprintf(name, sizeof name, "kv_append_q8_rows, %d rows%s", rows, mirror ? " (host copies, non-resident pages)" : "");
     report(name, same);
 }
+// ---- 8. a QSA layer's three norm + rope calls in one launch (STRATA_FUSE_NR3) ----
+void nr3_case(int n) {
+    const k::QsaShapes s = k::qsa_real_shapes();
+    const int HD = (int) s.head_dim, NH = (int) s.n_head, NKV = (int) s.n_head_kv, ID = (int) s.idx_dim, IQ = (int) s.idx_n_head;
+    std::mt19937 rng(331 + n);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto rnd = [&](size_t m, float sc) { std::vector<float> v(m); for (auto& x : v) x = nd(rng) * sc; return v; };
+    const std::vector<float> k0 = rnd((size_t) n * NKV * HD, 3.0f), qf = rnd((size_t) n * NH * 2 * HD, 2.0f),
+                             i0 = rnd((size_t) n * IQ * ID, 2.0f), gk = rnd(HD, 0.3f), gq = rnd(HD, 0.3f), gi = rnd(ID, 0.3f);
+    std::vector<int32_t> pos((size_t) n * (NH + NKV + IQ));
+    for (int t = 0; t < n; ++t) {
+        const int p = 1000 + 37 * t + (int) (rng() % 5000);
+        for (int h = 0; h < NH; ++h) pos[(size_t) t * NH + h] = p;                    // the window's layout: q,
+        for (int h = 0; h < NKV; ++h) pos[(size_t) n * NH + t * NKV + h] = p;        // then K,
+        for (int h = 0; h < IQ; ++h) pos[(size_t) n * (NH + NKV) + t * IQ + h] = p;  // then the indexer query
+    }
+    const int32_t* d_pos = up(pos);
+    const int32_t *pq = d_pos, *pk = d_pos + (size_t) n * NH, *pi = d_pos + (size_t) n * (NH + NKV);
+    const float *d_qf = up(qf), *d_gk = up(gk), *d_gq = up(gq), *d_gi = up(gi);
+    float *k_ref = up(k0), *k_seg = up(k0), *i_ref = up(i0), *i_seg = up(i0);
+    float *q_ref = up(std::vector<float>((size_t) n * NH * HD, 0.f)), *q_seg = up(std::vector<float>((size_t) n * NH * HD, 0.f));
+    cudaStream_t cs = nullptr;
+    ck(cudaStreamCreate(&cs), "stream");
+    const k::RopeScaling sc;
+    k::native_qsa_rms_norm_rope(k_ref, HD, d_gk, k_ref, n * NKV, HD, (int) s.n_rot, 1e-6f, sc, pk, cs);
+    k::native_qsa_rms_norm_rope(d_qf, 2 * HD, d_gq, q_ref, n * NH, HD, (int) s.n_rot, 1e-6f, sc, pq, cs);
+    k::native_qsa_rms_norm_rope(i_ref, ID, d_gi, i_ref, n * IQ, ID, (int) s.n_rot, 1e-6f, sc, pi, cs);
+    k::NormRopeSegs sg;
+    auto seg = [&](const float* x, int st, const float* g, float* o, int rows, int hd, const int32_t* p) {
+        sg.x[sg.n] = x; sg.in_stride[sg.n] = st; sg.gamma[sg.n] = g; sg.out[sg.n] = o; sg.rows[sg.n] = rows;
+        sg.head_dim[sg.n] = hd; sg.positions[sg.n++] = p;
+    };
+    seg(k_seg, HD, d_gk, k_seg, n * NKV, HD, pk);
+    seg(d_qf, 2 * HD, d_gq, q_seg, n * NH, HD, pq);
+    seg(i_seg, ID, d_gi, i_seg, n * IQ, ID, pi);
+    k::native_qsa_rms_norm_rope_segs(sg, (int) s.n_rot, 1e-6f, sc, cs);
+    ck(cudaStreamSynchronize(cs), "sync");
+    ck(cudaStreamDestroy(cs), "stream");
+    auto eq = [](const float* a, const float* b, size_t m) {
+        const std::vector<float> x = down(a, m), y = down(b, m);
+        return std::memcmp(x.data(), y.data(), m * 4) == 0;
+    };
+    char name[96];
+    std::snprintf(name, sizeof name, "norm_rope segs (K, q|gate, indexer q), %d rows", n);
+    report(name, eq(k_ref, k_seg, (size_t) n * NKV * HD) && eq(q_ref, q_seg, (size_t) n * NH * HD) &&
+                     eq(i_ref, i_seg, (size_t) n * IQ * ID));
+}
 }  // namespace
 
 int main() {
@@ -688,6 +738,7 @@ int main() {
     }
     for (const bool mirror : {false, true})
         for (int r : {1, 2, 4, 8}) kvrows_case(r, mirror);
+    for (int r : {1, 3, 8}) nr3_case(r);
     std::printf("%s\n", bad ? "batch_rows_parity: FAILED" : "batch_rows_parity: ok");
     return bad ? 1 : 0;
 }
