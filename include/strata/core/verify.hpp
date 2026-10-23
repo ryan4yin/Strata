@@ -442,7 +442,19 @@ private:
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
-    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
+    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err,
+                     bool defer_ple = false);
+    // STRATA_FUSE_PLELATE: stage_batch(defer_ple)'s PLE rows, gathered by run_slot_rows after the window's launch
+    // (ple_late_n_ tokens, 0 = none pending)
+    std::vector<uint32_t> ple_late_rows_;
+    int ple_late_n_ = 0;
+    bool gather_ple_late(std::string& err);
+public:
+    /// STRATA_FUSE_PLEPF: prefetch the PLE rows of slot `slot`'s next batch window row, keyed as stage_batch keys it:
+    /// row 0 (tok1 < 0) is token tok0 after the slot's committed history, row 1 is tok1 after (history[1], tok0).
+    /// A hint only (gather_batch reads every row a prefetch does not match).  False: nothing to prefetch here.
+    bool ple_prefetch_slot(int slot, int32_t tok0, int32_t tok1);
+private:
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
