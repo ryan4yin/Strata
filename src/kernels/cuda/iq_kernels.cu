@@ -2749,6 +2749,47 @@ template<> struct EdV2<18> {   // IQ3_XXS: a call's 8 grid bytes and its signs +
     }
 };
 
+template<> struct EdV2<21> {   // IQ3_S: a call's 8 grid bytes, qh byte, sign byte, scale byte, d
+    static constexpr int GW = 256, B = sizeof(block_iq3_s);   // codebook pairs (iq3s_grid: 512 words)
+    static_assert(B == 110, "IQ3_S block");
+    struct Raw { uint32_t q0, q1, sg, d; uint32_t qh, ls; };
+    using W = Split<21>::W;
+    __device__ static Raw load(ed_g8* blk, int ib) {
+        Raw w;
+        w.q0 = ed_ld_b2(blk + 2 + 8 * ib);
+        w.q1 = ed_ld_b2(blk + 2 + 8 * ib + 4);
+        w.qh = blk[66 + ib];
+        w.sg = ed_ld_b2(blk + 74 + 4 * ib);
+        w.ls = 1 + 2 * ((blk[106 + ib / 2] >> ((ib & 1) * 4)) & 0x0F);
+        w.d = ed_ld16(blk);
+        return w;
+    }
+    __device__ static void opaque(Raw& w) { asm volatile("" : "+v"(w.q0), "+v"(w.q1), "+v"(w.sg), "+v"(w.d), "+v"(w.qh), "+v"(w.ls)); }
+    __device__ static W decode(const Raw& w, const uint32_t* __restrict__ s_grid) {
+        W r;
+#pragma unroll
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const uint32_t qw = l0 < 4 ? w.q0 : w.q1;
+            const uint32_t qx = ((qw >> (8 * (l0 & 3))) & 0xff) | (((w.qh >> l0) & 1u) << 8);
+            const uint32_t qy = ((qw >> (8 * ((l0 & 3) + 1))) & 0xff) | (((w.qh >> (l0 + 1)) & 1u) << 8);
+            const uint32_t sb = (w.sg >> (8 * (l0 / 2))) & 0xff;
+            r.g[l0 + 0] = ed_neg4(s_grid[qx], sb & 0xf);
+            r.g[l0 + 1] = ed_neg4(s_grid[qy], sb >> 4);
+        }
+        r.ls = (int) w.ls;
+        r.dw = __half2float(__ushort_as_half((unsigned short) w.d));
+        return r;
+    }
+    __device__ static float apply(const W& r, const int (&u)[8], float d8) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
+        sumi *= r.ls;
+        const float d = r.dw * d8;
+        return d * sumi;
+    }
+};
+
 // The NP passes of 16 rows of a block (rb = 16 NP; sub-warp sw takes row row_base + 16 p + sw), lane t: calls
 // t + 32 j (j < 3) into s and t + 16 + 32 j (j < 2) into s16, as ed_gu_rows<TG, 1, NC>: kbx = t / 8 + {0, 4, 8},
 // {2, 6}, the sub-block t % 8.
@@ -2800,7 +2841,9 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_V2_MINB) expdec_gu_v2_kerne
         constexpr int NCB = (V::GW + 255) / 256;
         uint2 cb[NCB];
         if (first) {   // block-uniform
-            const uint2* src = TG == 22 ? (const uint2*) iq2s_grid : (const uint2*) iq3xxs_grid;
+            const uint2* src = TG == 22 ? (const uint2*) iq2s_grid
+                              : TG == 21 ? (const uint2*) iq3s_grid
+                                         : (const uint2*) iq3xxs_grid;
 #pragma unroll
             for (int i = 0; i < NCB; ++i) cb[i] = src[min(tid + 256 * i, V::GW - 1)];
         }
@@ -4488,7 +4531,7 @@ int g_expdec_v2 = env_int_or("STRATA_EXPDEC_V2", 0);        // 1 (AMD): expdec_g
 // expdec_gu_r takes expdec_gu_v2_kernel for this format, rows per lane and rows per block
 bool expdec_gu_v2_on(int tg, int r, int rb) {
 #if defined(__HIPCC__)
-    return g_expdec_v2 && (tg == 22 || tg == 18) && r == 1 && (rb == 16 || rb == 32);   // (rb 64: 4 passes in registers spill)
+    return g_expdec_v2 && (tg == 22 || tg == 18 || tg == 21) && r == 1 && (rb == 16 || rb == 32);   // (rb 64: 4 passes in registers spill)
 #else
     (void) tg; (void) r; (void) rb;
     return false;
@@ -4533,7 +4576,7 @@ void expdec_gu_r(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned 
     const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
     const bool swe = sw_hq != nullptr && rb % 32 == 0 && L.n_ff % rb == 0;   // STRATA_FUSE_SWIGLU_GU (column chunks)
 #if defined(__HIPCC__)
-    if constexpr (R == 1 && (TG == 22 || TG == 18)) {
+    if constexpr (R == 1 && (TG == 22 || TG == 18 || TG == 21)) {
         if (expdec_gu_v2_on(TG, R, rb)) {
             const bool swe2 = sw_hq != nullptr && L.n_ff % 32 == 0;   // (rb 16 / 32: 32-column chunks)
             auto v2 = [&](auto np) {
