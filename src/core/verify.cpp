@@ -488,6 +488,12 @@ bool fuse_combine_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_COMBINE"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
+// STRATA_FUSE_SHPAIR=1: the shared expert's gate and up in one launch (native_mmvq_pair, which covers the K-quant /
+// IQ4_XS kernels under the same switch) outside STRATA_LFUSE too.  Opt-in.
+bool fuse_shpair_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHPAIR"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
 // STRATA_FUSE_SHGATE=1 (with STRATA_FUSE_COMBINE, outside the all-resident path): the shared expert's gate row rides in
 // the router's GEMV launch (bf16_gemv_fp32_mmvf_multi_aux) and its sigmoid + row scale in that combine
 // (native_moe_combine_multi_hits_mapped's shared_gate), as STRATA_LFUSE does on the all-resident path: two kernel nodes
@@ -2433,7 +2439,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    (sg_ready ? 1 : 0) | ((lfuse_on(n) && g_lfuse_pair()) || fuse_shpair_on() ? 2 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();

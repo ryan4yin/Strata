@@ -1619,6 +1619,58 @@ __global__ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, con
         }
     }
 }
+// STRATA_FUSE_SHPAIR: two b6_mmvq_rows_kernel launches of one shape and input (the shared expert's gate and up) as one:
+// block row 0 is the first's blocks, row 1 the second's.  The body is b6_mmvq_rows_kernel's, copied (a shared
+// forceinline body changed the kernel's gfx1201 schedule - same instructions, other VOPD pairing)
+template<typename F, int NCOLS, int ROWS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void b6_mmvq_rows_pair_kernel(const typename F::Block* __restrict__ w1, const typename F::Block* __restrict__ w2,
+                                         const Q81Block* __restrict__ x, float* __restrict__ y1, float* __restrict__ y2,
+                                         int n_in, int n_out) {
+    const typename F::Block* __restrict__ w = blockIdx.y == 0 ? w1 : w2;
+    float* __restrict__ y = blockIdx.y == 0 ? y1 : y2;
+    using XB = B6X<F>;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(tid);
+    float tmp[NCOLS][ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        typename XB::X xv[NCOLS];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) xv[j] = XB::xload(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename XB::W wv = XB::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    mmvq_sync_lds();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
 
 // B7 (STRATA_DENSE_LDS=1, or b6 rows mode 16): the window's activations staged in LDS once per block, R rows per
 // warp over the whole row, NWB warps per block.  Each lane replays the per-thread work of the one-column kernel's four
@@ -1688,8 +1740,9 @@ void b7_go(const typename F::Block* w, const Q81Block* x, float* y, int n_in, in
     b7_mmvq_lds_kernel<F, NCOLS, R, NWB><<<unsigned((n_out + NWB * R - 1) / (NWB * R)), dim3(WARP, NWB), lds, s>>>(
         w, x, y, n_in, n_out);
 }
+// b7_launch takes the call (STRATA_FUSE_SHPAIR asks without launching)
 template<typename F, int NCOLS>
-bool b7_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+bool b7_takes(int n_in, int n_out) {
     if constexpr (!B6X<F>::ok) {
         return false;
     } else {
@@ -1699,6 +1752,16 @@ bool b7_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         if (n_in > 4096 || n_out < 2048 || n_in / F::DIV < 1 || lds > 64 * 1024) return false;
         // Q6_K: B6 is as fast below 6 columns (below 4 for the heads)
         if (std::is_same_v<F, Q6KTraits> && NCOLS < (n_out >= 65536 ? 4 : 6)) return false;
+        return true;
+    }
+}
+template<typename F, int NCOLS>
+bool b7_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    if constexpr (!B6X<F>::ok) {
+        return false;
+    } else {
+        if (!b7_takes<F, NCOLS>(n_in, n_out)) return false;
+        const std::size_t lds = std::size_t(NCOLS) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
         const int r = b7_rows(n_out, NCOLS);
         if (r == 1) b7_go<F, NCOLS, 1, 8>(w, x, y, n_in, n_out, lds, s);
         else if (r == 2) b7_go<F, NCOLS, 2, 8>(w, x, y, n_in, n_out, lds, s);
@@ -1754,6 +1817,73 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         else
             b6_mmvq_rows_kernel<F, NCOLS, 4><<<unsigned((n_out + 3) / 4), threads, 0, s>>>(w, x, y, n_in, n_out);
         return true;
+    }
+}
+
+// STRATA_FUSE_SHPAIR: launch_multi_n for two weights of one shape and input in one launch - b6_mmvq_rows_pair_kernel
+// where b6_launch would take b6_mmvq_rows_kernel (B7 not taking it), else native_mmvq_multi_kernel's PAIR form where
+// launch_multi_n would take its exact rows kernel; the same rows per block, so the same values.  false: nothing ran
+// (B7, or the inexact layout)
+template<typename F, int NCOLS>
+bool b6_pair_launch(const typename F::Block* w1, const typename F::Block* w2, const Q81Block* x, float* y1, float* y2,
+                    int n_in, int n_out, cudaStream_t s) {
+    const dim3 threads(WARP, WARPS);
+    if constexpr (B6X<F>::ok) {   // b6_launch's choice
+        const int mode = b6_rows_mode();
+        if (g_multi_exact && !s26_tsum_on() && (mode == 16 || (mode != 0 && b7_on())) && b7_takes<F, NCOLS>(n_in, n_out))
+            return false;
+        int rows = 0;
+        if (!(mode == 0 || mode == 16 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1)) {
+            if (mode < 0) {
+                if (dev_class() == 1) rows = b6_default_rows_gfx12<F, NCOLS>(n_out);
+            } else if (mode == 1) {
+                rows = 2;
+            } else {
+                rows = mode;
+            }
+        }
+        if (rows > 0) {
+            if (rows == 2)
+                b6_mmvq_rows_pair_kernel<F, NCOLS, 2><<<dim3(unsigned((n_out + 1) / 2), 2), threads, 0, s>>>(w1, w2, x, y1, y2, n_in, n_out);
+            else if (rows == 8)
+                b6_mmvq_rows_pair_kernel<F, NCOLS, 8><<<dim3(unsigned((n_out + 7) / 8), 2), threads, 0, s>>>(w1, w2, x, y1, y2, n_in, n_out);
+            else
+                b6_mmvq_rows_pair_kernel<F, NCOLS, 4><<<dim3(unsigned((n_out + 3) / 4), 2), threads, 0, s>>>(w1, w2, x, y1, y2, n_in, n_out);
+            return true;
+        }
+    }
+    if (!g_multi_exact) return false;   // launch_multi_n's choice after b6_launch declined
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
+        if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true>, dim3(unsigned(2 * n_out)), threads, 0, s, w1, x, y1, n_in, n_out, w2, y2);
+        else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true>, dim3(unsigned(2 * n_out)), threads, 0, s, w1, x, y1, n_in, n_out, w2, y2);
+        return true;
+    }
+    constexpr int ROWS = 2;
+    if (n_out % ROWS != 0) return false;   // the PAIR form splits the grid at n_out / ROWS
+    const unsigned blocks = unsigned(2 * (n_out / ROWS));
+    if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, true>, dim3(blocks), threads, 0, s, w1, x, y1, n_in, n_out, w2, y2);
+    else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, true>, dim3(blocks), threads, 0, s, w1, x, y1, n_in, n_out, w2, y2);
+    return true;
+}
+template<typename F>
+bool b6_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in, int n_out, int ncols,
+             cudaStream_t s) {
+    const auto* a = static_cast<const typename F::Block*>(w1);
+    const auto* b = static_cast<const typename F::Block*>(w2);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    switch (ncols) {
+        case 2: return b6_pair_launch<F, 2>(a, b, x, y1, y2, n_in, n_out, s);
+        case 3: return b6_pair_launch<F, 3>(a, b, x, y1, y2, n_in, n_out, s);
+        case 4: return b6_pair_launch<F, 4>(a, b, x, y1, y2, n_in, n_out, s);
+        case 5: return b6_pair_launch<F, 5>(a, b, x, y1, y2, n_in, n_out, s);
+        case 6: return b6_pair_launch<F, 6>(a, b, x, y1, y2, n_in, n_out, s);
+        case 7: return b6_pair_launch<F, 7>(a, b, x, y1, y2, n_in, n_out, s);
+        case 8: return b6_pair_launch<F, 8>(a, b, x, y1, y2, n_in, n_out, s);
+        default: return false;
     }
 }
 
@@ -3612,8 +3742,44 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
 }
 
+// STRATA_FUSE_SHPAIR=1 (opt-in): native_mmvq_pair also covers the K-quant / IQ4_XS calls (b6 rows or the exact multi kernel)
+static bool fuse_shpair_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_SHPAIR"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// the K-quant / IQ4_XS pair (b6_pair_launch): the calls as native_q{4,5,6}_k_mmvq / native_iq4_xs_mmvq would launch them
+static bool mmvq_pair_kq(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2, int n_in,
+                         int n_out, int ncols, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    (void) ggml_type; (void) w1; (void) w2; (void) x_q8_1; (void) y1; (void) y2; (void) n_in; (void) n_out; (void) ncols;
+    (void) stream;
+    return false;
+#else
+    if (ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 256 != 0 || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+        return false;
+    const auto s = static_cast<cudaStream_t>(stream);
+    bool ran = false;
+    switch (ggml_type) {
+        case 12: ran = b6_pair<Q4KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 13: ran = b6_pair<Q5KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        case 14: {
+            const auto& reg = q6_packed_registry();   // STRATA_Q6_PACKED tensors take their own kernel
+            if (!reg.empty() && (reg.count(w1) || reg.count(w2))) return false;
+            ran = b6_pair<Q6KTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s);
+            break;
+        }
+        case 23: ran = b6_pair<IQ4XSTraits>(w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, s); break;
+        default: return false;
+    }
+    if (ran) launch_check();
+    return ran;
+#endif
+}
+
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (ggml_type != 8 && fuse_shpair_on()) return mmvq_pair_kq(ggml_type, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
     if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
@@ -3636,6 +3802,12 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     }
     launch_check();
     return true;
+}
+
+bool native_mmvq_pair_any(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
+                          int n_in, int n_out, int ncols, void* stream) {
+    if (ggml_type != 8) return mmvq_pair_kq(ggml_type, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
+    return native_mmvq_pair(ggml_type, w1, w2, x_q8_1, y1, y2, n_in, n_out, ncols, stream);
 }
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
