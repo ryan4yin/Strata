@@ -52,6 +52,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -545,6 +546,14 @@ bool fuse_kvrows_on() {
 // after its resolve and merges all rows' partials in one launch at the end (qsa_decode_attn_batch_chunks / _merge)
 bool fuse_attnmerge_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_ATTNMERGE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
+// fuse-gdn: STRATA_FUSE_QSAWAVE=1 (with STRATA_FUSE_ATTNMERGE=1) - the streamed per-row QSA path takes the window's rows
+// in waves, wave w = the w-th row of every slot group: one resolve launch (kv_stream_resolve_rows, a block per row, each
+// its own slot's map) and one chunk launch (qsa_decode_attn_wave_chunks) per wave.  A slot's rows keep their order.
+bool fuse_qsawave_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_QSAWAVE"); return v != nullptr && std::atoi(v) != 0; }();
     return on;
 }
 
@@ -2180,6 +2189,54 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, te - tb, max_blocks_,
                                            cap_, s, sel_ + (size_t) tb * cap_, cs);
                     }
+                    // STRATA_FUSE_QSAWAVE: the rows by waves (the w-th row of every slot group), every row a streamed
+                    // layer of one format and a wave's maps all different (else the per-row loop below)
+                    int g_first[KvResolveRows::kMax], g_size[KvResolveRows::kMax], n_groups = 0, n_waves = 0;
+                    bool waves = merge_late && fuse_qsawave_on() && te - tb <= KvResolveRows::kMax;
+                    for (int t = tb; waves && t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        if (sx.kv_mode != 1 || qsa_kv_format(sx) != qsa_kv_format(slot_ss(tb).qsa_states[qi])) waves = false;
+                        if (t == tb || brow_[t] != brow_[t - 1]) { g_first[n_groups] = t; g_size[n_groups++] = 0; }
+                        const int w = g_size[n_groups - 1]++;
+                        n_waves = w + 1 > n_waves ? w + 1 : n_waves;
+                        for (int g = 0; g + 1 < n_groups; ++g)   // the same wave's row of an earlier group: another map
+                            if (w < g_size[g] && slot_ss(g_first[g] + w).qsa_states[qi].map.ctl == sx.map.ctl) waves = false;
+                    }
+                    if (waves) {
+                        for (int t = tb; !sel_done && t < te; ++t) {   // the selections first (as STRATA_FUSE_QSASEL)
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + t * IQ * ID, step_ + t * kStepCount, 1,
+                                             max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
+                            qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_ + t * kStepCount, 1, max_blocks_, cap_, s,
+                                           sel_ + (size_t) t * cap_, cs);
+                        }
+                        for (int w = 0; w < n_waves; ++w) {
+                            KvResolveRows kr;
+                            QsaAttnWave aw;
+                            for (int g = 0; g < n_groups; ++g) {
+                                if (w >= g_size[g]) continue;
+                                const int t = g_first[g] + w;
+                                const QsaState& sx = slot_ss(t).qsa_states[qi];
+                                kr.m[kr.n] = sx.map;
+                                kr.slots[kr.n] = qsa_attn_pools(sx);
+                                kr.host[kr.n] = sx.host;
+                                kr.row[kr.n++] = t - tb;
+                                aw.p[aw.n] = qsa_attn_pools(sx);
+                                aw.row[aw.n++] = t - tb;
+                            }
+                            kv_stream_resolve_rows(kr, qsa_kv_format(slot_ss(tb).qsa_states[qi]), sel_ + (size_t) tb * cap_,
+                                                   step_ + tb * kStepCount, cap_, s, cs, kv_stream_fuse_copy_on());
+                            if (!qsa_decode_attn_wave_chunks(qcur_ + tb * NH * HD, aw, sel_ + (size_t) tb * cap_,
+                                                             step_ + tb * kStepCount, cap_, s,
+                                                             attn_scratch_ + (size_t) tb * attn_scratch_floats_, cs))
+                                for (int z = 0; z < aw.n; ++z) {
+                                    const int t = tb + aw.row[z];
+                                    qsa_decode_attn_batch_chunks(qcur_ + t * NH * HD, aw.p[z], sel_ + (size_t) t * cap_,
+                                                                 step_ + t * kStepCount, cap_, s,
+                                                                 attn_scratch_ + (size_t) t * attn_scratch_floats_, 1, cs);
+                                }
+                        }
+                    } else
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
                         if (!sel_done) {
