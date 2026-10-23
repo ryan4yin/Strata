@@ -563,6 +563,14 @@ bool fuse_qsawave_on() {
     return on;
 }
 
+// fuse-gdn: STRATA_FUSE_NR3=1 (with the fused norm + rope, STRATA_NORM_ROPE=1 on HIP) - a QSA layer's K, query and indexer
+// query norm + rope in one launch (native_qsa_rms_norm_rope_segs); the query's and the indexer query's projections,
+// which read only the layer's input, run before it instead of after the K/V appends
+bool fuse_nr3_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_FUSE_NR3"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 // 143-amdk: STRATA_FUSE_HITS - moe_hit_add folded into the combine (gfx12 default; =0 / 1 forces off / on)
 bool fuse_hits_on() {
 #if defined(STRATA_USE_HIP)
@@ -2024,6 +2032,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 7, grp);
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                // STRATA_FUSE_NR3: the three norm + rope calls of the batched path (K here, the query in q_chain, the
+                // indexer query in idx_query) as one launch, each segment that call's arguments
+                const bool nr3 = fuse_nr3_on() && fuse_nr && qb && !sidem && !side_proj && !qbr &&
+                                 native_norm_rope_usable((int) ID, (int) s.n_rot);
+                if (nr3) {
+                    mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));   // q_chain's projection
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                                              N, IQ * ID, n, cs);                          // idx_query's
+                    NormRopeSegs sg;
+                    auto seg = [&](const float* x, int stride, const WeightRef* w, float* out, int rows, int hd, const int32_t* pos) {
+                        sg.x[sg.n] = x; sg.in_stride[sg.n] = stride; sg.gamma[sg.n] = (const float*) w->data; sg.out[sg.n] = out;
+                        sg.rows[sg.n] = rows; sg.head_dim[sg.n] = hd; sg.positions[sg.n++] = pos;
+                    };
+                    seg(kcur_ + tb * NKV * HD, (int) HD, wkn, kcur_ + tb * NKV * HD, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
+                    seg(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), wqn, qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                    seg(qidx_ + tb * IQ * ID, (int) ID, wiqn, qidx_ + tb * IQ * ID, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
+                    native_qsa_rms_norm_rope_segs(sg, (int) s.n_rot, EPS, rope_scaling(), cs);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // q_chain's rotation
+                } else
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -2105,7 +2132,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 9, grp);
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
-                } else {
+                } else if (!nr3) {
                     if (!side_proj && !q_chain(cs)) return false;
                     if (!sidem) idx_query(cs);
                 }
