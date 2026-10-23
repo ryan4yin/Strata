@@ -1344,6 +1344,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(b6_mmvq_bench src/kernels/b6_mmvq_bench.cpp)
   target_include_directories(b6_mmvq_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(b6_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  # STRATA_FUSE_PROJ: a window's projections of one input in one launch against their own calls, timed, bitwise
+  add_executable(proj_bench src/kernels/proj_bench.cpp)
+  target_include_directories(proj_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(proj_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   if(STRATA_ENABLE_HIP)
     # DPP and the HIP __shfl_xor side by side, every constant mask x width, full and partial waves, bit for bit
     add_executable(dpp_xor_parity src/kernels/dpp_xor_parity.cpp)

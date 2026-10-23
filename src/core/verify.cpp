@@ -1748,7 +1748,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                // STRATA_FUSE_PROJ: qkv and z in one launch (bitwise the two calls; z is read only after the recurrence)
+                bool proj_z = false;
+                if (!side_proj && !br && strata::kernels::native_mmvq_proj_on()) {
+                    const strata::kernels::MmvqSeg sg[2] = {{wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C, (int) C},
+                                                            {wg->native_type, wg->native_data, z_ + (size_t) tb * ZV, (int) ZV}};
+                    proj_z = strata::kernels::native_mmvq_proj(sg, 2, xq_, (int) N, n, cs);
+                }
+                if (!side_proj && !proj_z) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 // STRATA_FUSE_GDNCONV: the slot groups' convs (=2: and the a/b projections) in one launch
                 bool conv_grouped = false, ab_done = false;
@@ -1809,7 +1816,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !proj_z) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -2096,14 +2103,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 // STRATA_FUSE_NR3: the three norm + rope calls of the batched path (K here, the query in q_chain, the
                 // indexer query in idx_query) as one launch, each segment that call's arguments
                 const bool nr3 = fuse_nr3_on() && fuse_nr && qb && !sidem && !side_proj && !qbr &&
                                  native_norm_rope_usable((int) ID, (int) s.n_rot);
+                // STRATA_FUSE_PROJ: k, v and (NR3) q_chain's projection in one launch, bitwise the three calls (k + v
+                // alone is slower as one launch: not paired)
+                bool proj_kvq = false;
+                if (nr3 && strata::kernels::native_mmvq_proj_on()) {
+                    const strata::kernels::MmvqSeg sg[3] = {
+                        {wk->native_type, wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        {wv->native_type, wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        {wq->native_type, wq->native_data, qfull_ + tb * NH * 2 * HD, (int) (NH * 2 * HD)}};
+                    proj_kvq = strata::kernels::native_mmvq_proj(sg, 3, xq_, (int) N, n, cs);
+                }
+                if (!proj_kvq) {
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (nr3) {
-                    mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));   // q_chain's projection
+                    if (!proj_kvq) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));   // q_chain's projection
                     if (!idx_paired)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);                          // idx_query's
