@@ -990,7 +990,7 @@ __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __r
     unpack32(ckv + (size_t) sel[(size_t) t * sel_stride + i] * kv_row_bytes(kKvFp4, 512), part, (uint4*) (out + r * 512 + part * 32));
 }
 
-template <int G>
+template <int G, bool SAVE_V = false>
 __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const float* __restrict__ q,
                                                                       const uint16_t* __restrict__ win,
                                                                       const uint8_t* __restrict__ ckv,
@@ -1028,6 +1028,9 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
 #pragma unroll
     for (int g = 0; g < G; ++g) o0[g] = o1[g] = 0.0f;
     const int c = threadIdx.x * 2;
+    // SAVE_V: keep this thread's two V columns from the first (QK) staging pass.  The weighted-sum pass then does
+    // not decode the same FP4 rows and refill the tile a second time.  Two BF16 values pack into one register.
+    uint32_t saved_v[SAVE_V ? kAttTile : 1];
     const int sr = threadIdx.x >> 4, part = threadIdx.x & 15;   // the staging: a thread's row and 32 values
     // rows [s0, s0 + n) of the tile at t0 into tile[] as BF16
     auto stage = [&](int t0, int s0, int n) {
@@ -1052,10 +1055,17 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
             rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
         }
         __syncthreads();
-        for (int s0 = 0; s0 < nt; s0 += kStage) {   // the dots
+#pragma unroll
+        for (int s0 = 0; s0 < kAttTile; s0 += kStage) {   // the dots
+            if (s0 >= nt) break;
             const int n = min(kStage, nt - s0);
             stage(t0, s0, n);
             __syncthreads();
+            if constexpr (SAVE_V) {
+#pragma unroll
+                for (int i = 0; i < kStage; ++i)
+                    if (i < n) saved_v[s0 + i] = *(const uint32_t*) (tile + i * d + c);
+            }
 #if !defined(STRATA_USE_HIP)   // (HIP leaves a loop with shuffles and a remainder rolled anyway)
 #pragma unroll 2
 #endif
@@ -1103,12 +1113,18 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
             o0[g] *= cs;
             o1[g] *= cs;
         }
-        for (int s0 = 0; s0 < nt; s0 += kStage) {   // the weighted sums
+#pragma unroll
+        for (int s0 = 0; s0 < kAttTile; s0 += kStage) {   // the weighted sums
+            if (s0 >= nt) break;
             const int n = min(kStage, nt - s0);
-            stage(t0, s0, n);
-            __syncthreads();
-            for (int r = 0; r < n; ++r) {
-                const uint32_t pr = *(const uint32_t*) (tile + r * d + c);
+            if constexpr (!SAVE_V) {
+                stage(t0, s0, n);
+                __syncthreads();
+            }
+#pragma unroll
+            for (int r = 0; r < kStage; ++r) {
+                if (r >= n) break;
+                const uint32_t pr = SAVE_V ? saved_v[s0 + r] : *(const uint32_t*) (tile + r * d + c);
                 const float v0 = bf16f((uint16_t) (pr & 0xffffu)), v1 = bf16f((uint16_t) (pr >> 16));
 #pragma unroll
                 for (int g = 0; g < G; ++g) {
@@ -1116,8 +1132,9 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
                     o1[g] += sc[g][s0 + r] * v1;
                 }
             }
-            __syncthreads();
+            if constexpr (!SAVE_V) __syncthreads();
         }
+        if constexpr (SAVE_V) __syncthreads();   // nobody may overwrite sc/rows until every warp has finished its sums
     }
 #pragma unroll
     for (int g = 0; g < G; ++g) {
@@ -2103,10 +2120,21 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % G != 0) G = 1;
     const dim3 grid(heads / G, T);
     const uint8_t* c = (const uint8_t*) ckv;
-    if (G == 8) sparse_attn_packed_kernel<8><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else sparse_attn_packed_kernel<1><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    static const bool save_v = std::getenv("DS4_ATTN_SAVE") != nullptr && std::atoi(std::getenv("DS4_ATTN_SAVE")) != 0;
+    const bool saved = save_v && T > kAttnScratchT;
+    if (G == 8) {
+        if (saved) sparse_attn_packed_kernel<8, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else sparse_attn_packed_kernel<8, false><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    } else if (G == 4) {
+        if (saved) sparse_attn_packed_kernel<4, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else sparse_attn_packed_kernel<4, false><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    } else if (G == 2) {
+        if (saved) sparse_attn_packed_kernel<2, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else sparse_attn_packed_kernel<2, false><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    } else {
+        if (saved) sparse_attn_packed_kernel<1, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else sparse_attn_packed_kernel<1, false><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    }
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
