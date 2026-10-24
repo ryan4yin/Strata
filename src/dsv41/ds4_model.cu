@@ -1228,6 +1228,11 @@ struct Model::Impl {
         cudaEventCreate(&e);
         return e;
     }
+    // Detail events do not move the ordinary stage timeline: 0..5 therefore keep their old meaning.  At a layer's
+    // stage 0 the detail clock restarts; each 100+stage mark accounts the interval since the previous detail mark.
+    void prof_detail(const Dev& d, int stage) {
+        if (prof_window && !prof_chunk) prof_mark(d, 100 + stage);
+    }
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -1248,8 +1253,18 @@ struct Model::Impl {
     void prof_collect() {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
-        std::vector<std::pair<const Dev*, cudaEvent_t>> last;
+        std::vector<std::pair<const Dev*, cudaEvent_t>> last, detail;
         for (const ProfMark& m : prof_marks) {
+            if (m.stage >= 100) {
+                auto it = std::find_if(detail.begin(), detail.end(), [&](const auto& x) { return x.first == m.d; });
+                if (it != detail.end()) {
+                    float ms = 0.0f;
+                    cudaSetDevice(m.d->id);
+                    if (cudaEventElapsedTime(&ms, it->second, m.ev) == cudaSuccess) st.prof_ms[m.stage - 100] += ms;
+                    it->second = m.ev;
+                }
+                continue;
+            }
             auto it = std::find_if(last.begin(), last.end(), [&](const auto& x) { return x.first == m.d; });
             if (it != last.end()) {
                 float ms = 0.0f;
@@ -1259,6 +1274,11 @@ struct Model::Impl {
                 it->second = m.ev;
             } else {
                 last.push_back({m.d, m.ev});
+            }
+            if (m.stage == 0) {
+                auto it = std::find_if(detail.begin(), detail.end(), [&](const auto& x) { return x.first == m.d; });
+                if (it == detail.end()) detail.push_back({m.d, m.ev});
+                else it->second = m.ev;
             }
         }
         for (const ProfMark& m : prof_marks) prof_pool[m.d->id].push_back(m.ev);
@@ -9127,6 +9147,7 @@ struct Model::Impl {
         hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
                      d.a_pre, d.a_post, d.a_comb, s);
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        prof_detail(d, 6);   // Engram + attention mHC
         {
             x3::MvJob j[4];
             int nj = 0;
@@ -9136,6 +9157,7 @@ struct Model::Impl {
             if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
             if (!mv_n(d, j, nj, err)) return false;
         }
+        prof_detail(d, 7);   // wq_a / wkv and their norms
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
@@ -9149,6 +9171,7 @@ struct Model::Impl {
             fr.freqs = freqs;
             finish(d.q, T * NHL, HD, HD, fr, s);
         }
+        prof_detail(d, 8);   // wq_b + RoPE
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
@@ -9314,9 +9337,11 @@ struct Model::Impl {
             ckv_fmt = kKvBf16;
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
         }
+        prof_detail(d, 9);   // KV compression + indexer / topk
         if (NHL > 0) {
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
                         1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
+            prof_detail(d, 10);  // sparse attention
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) p0;
@@ -9336,6 +9361,7 @@ struct Model::Impl {
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
+        prof_detail(d, 11);  // inverse RoPE + wo_a/b + attention hc_post
         prof_mark(d, 1);
         // the MoE
         hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
