@@ -1046,6 +1046,7 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        cudaEvent_t prompt_done = nullptr;   // opt-in prompt settle: the layer's last expert read on its compute stream
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1157,6 +1158,13 @@ struct Model::Impl {
     std::vector<SwapBufs> sw_bufs;
     std::vector<std::thread> cache_ths;
     int sw_inflight = 0;
+    // DS4_SETTLE_OVERLAP=1: a chunked prompt settles each nm1 layer after its last use.  Workers only record
+    // prompt_done and publish settle_ready; the forward_chunks thread alone changes cache policy and metadata.
+    const bool settle_overlap = env_f("DS4_SETTLE_OVERLAP", 0.0f) != 0.0f;
+    bool settle_running = false, settle_draining = false;
+    std::vector<cudaEvent_t> settle_ev;
+    std::unique_ptr<std::atomic<int>[]> settle_ready;
+    std::vector<char> settle_open;
     int64_t decay_tokens = 0;
     bool check_swaps = std::getenv("DS4_CHECK_SWAPS") != nullptr;
     std::vector<float> host_logits;
@@ -6342,10 +6350,13 @@ struct Model::Impl {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaStream_t cs = B.st[(size_t) l.dev];
+                if (sw.prompt_done != nullptr) (void) cudaStreamWaitEvent(cs, sw.prompt_done, 0);
                 cudaMemcpyAsync(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cudaMemcpyHostToDevice, cs);
-                if (!file_experts)
+                if (!file_experts) {
+                    if (sw.prompt_done != nullptr) (void) cudaStreamWaitEvent(cs, sw.prompt_done, 0);
                     cudaMemcpyAsync(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
                                     cudaMemcpyDeviceToHost, cs);
+                }
                 cudaStreamSynchronize(cs);
             } else {   // a group: each member's part in, each member's part out
                 for (int m = 0; m < l.nm; ++m) {
@@ -6420,8 +6431,9 @@ struct Model::Impl {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
             cudaStream_t cs = copy_st[(size_t) x.dev];
+            if (sw.prompt_done != nullptr) ok = ok && cudaStreamWaitEvent(cs, sw.prompt_done, 0) == cudaSuccess;
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * unit(l), l.nm > 1 ? sw_h : sw_a, unit(l),
+            ok = ok && cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * unit(l), l.nm > 1 ? sw_h : sw_a, unit(l),
                                  cudaMemcpyHostToDevice, cs) == cudaSuccess &&
                  cudaStreamSynchronize(cs) == cudaSuccess;
         }
@@ -6431,7 +6443,8 @@ struct Model::Impl {
                 const Layer& x = member(l, m);
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l),
+                if (sw.prompt_done != nullptr) got = cudaStreamWaitEvent(cs, sw.prompt_done, 0) == cudaSuccess;
+                got = got && cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l),
                                       unit(l), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
@@ -6476,6 +6489,82 @@ struct Model::Impl {
         } else if (!ok) {
             std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
         }
+    }
+
+    bool settle_candidate(const Layer& l) const {
+        return !l.mtp && l.nm == 1 && l.spare_vram >= 0;
+    }
+    // Commit old work before a run, or an overlapped run's residual before its events are destroyed.  No new swaps or
+    // RAM-tier moves are selected here; in particular, nothing can be published into a layer the prompt still uses.
+    void settle_drain(bool include_ram) {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        settle_draining = true;
+        while (sw_inflight != 0 || (include_ram && ram_inflight != 0)) {
+            cache_tick_swaps(0);
+            if (sw_inflight != 0 || (include_ram && ram_inflight != 0))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        settle_draining = false;
+    }
+    bool settle_begin(std::string& err) {
+        if (!settle_overlap || !o.expert_cache || cache_ths.empty()) return true;
+        for (const Layer& l : L)   // the prototype is only for the accepted layer-split configuration
+            if (!l.mtp && l.nm != 1) return true;
+        settle_drain(true);   // no earlier window's commit may land after plan_streams()
+        settle_ev.assign(L.size(), nullptr);
+        settle_open.assign(L.size(), 0);
+        settle_ready.reset(new std::atomic<int>[L.size()]);
+        for (const Layer& l : L) {
+            settle_ready[(size_t) l.il].store(0, std::memory_order_relaxed);
+            if (!settle_candidate(l)) continue;
+            cudaSetDevice(devs[(size_t) l.dev].id);
+            CK(cudaEventCreateWithFlags(&settle_ev[(size_t) l.il], cudaEventDisableTiming));
+        }
+        settle_running = true;
+        return true;
+    }
+    void settle_finish() {
+        if (settle_ev.empty() && !settle_ready) return;
+        settle_running = false;
+        // Independent RAM-tier moves have no event into this run and keep the baseline's asynchronous lifetime.
+        settle_drain(false);   // a budget-limited cache_settle() may leave VRAM copies using these events
+        for (size_t il = 0; il < settle_ev.size(); ++il) {
+            if (settle_ev[il] == nullptr) continue;
+            cudaSetDevice(devs[(size_t) L[il].dev].id);
+            (void) cudaEventDestroy(settle_ev[il]);
+        }
+        settle_ev.clear();
+        settle_open.clear();
+        settle_ready.reset();
+    }
+    bool settle_arm(Layer& l, cudaStream_t s, std::string& err) {
+        if (!settle_running || !settle_candidate(l)) return true;
+        CK(cudaEventRecord(settle_ev[(size_t) l.il], s));
+        settle_ready[(size_t) l.il].store(1, std::memory_order_release);
+        return true;
+    }
+    void cache_overlap_pump() {
+        if (!settle_running) return;
+        bool work = false;
+        for (Layer& l : L) {
+            if (!settle_candidate(l) || settle_open[(size_t) l.il] ||
+                settle_ready[(size_t) l.il].load(std::memory_order_acquire) == 0)
+                continue;
+            settle_open[(size_t) l.il] = 1;   // release in settle_arm publishes this layer's final heat and hits
+            work = true;
+        }
+        {
+            std::lock_guard<std::mutex> lk(sw_mu);
+            work = work || !sw_ready.empty();
+        }
+        if (!work) return;
+        for (Layer& l : L) {
+            if (!settle_open[(size_t) l.il] || l.swap_pending) continue;
+            l.cpu_hits.clear();
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+        }
+        cache_tick_swaps(0);   // no store_sync(): store visibility remains a window/run boundary operation
     }
 
     // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
@@ -6632,6 +6721,8 @@ struct Model::Impl {
         }
         bool queued = false, rqueued = false;
         for (Layer& l : L) {
+            if (settle_draining) continue;
+            if (settle_running && (settle_open.empty() || !settle_open[(size_t) l.il])) continue;
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
@@ -6647,13 +6738,16 @@ struct Model::Impl {
                     ++sw_inflight;
                     vin = best;
                     Swap sw{l.il, best, cold};
+                    if (settle_running) sw.prompt_done = settle_ev[(size_t) l.il];
                     if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
                     queued = true;
                 }
             }
-            if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
+            // Independent RAM-tier moves wait for the ordinary end-of-run tick.  A VRAM swap's own outgoing RAM copy
+            // remains part of that swap and is protected by prompt_done like its H2D.
+            if (settle_running || l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
             int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
             for (int e : hits)
                 if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
@@ -7900,6 +7994,7 @@ struct Model::Impl {
                     if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
                 }
             }
+            if (!settle_arm(L0, s, err)) return false;   // layer-major: all of this layer's chunks are now enqueued
             lm_layers.store((int) li + 1, std::memory_order_release);
         }
         return true;
@@ -8058,6 +8153,7 @@ struct Model::Impl {
                     }
                 }
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
+                if (last_k && !settle_arm(L0, s, err)) return false;   // no later chunk reads this layer's experts
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
                 if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
@@ -8504,6 +8600,11 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        struct SettleEnd {   // events stay alive until every overlapped copy is committed, on every exit
+            Impl* p;
+            ~SettleEnd() { p->settle_finish(); }
+        } settle_end{this};
+        if (!settle_begin(err)) return false;
         // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
         // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
         // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
@@ -8588,6 +8689,7 @@ struct Model::Impl {
             });
         size_t reported = 0;
         for (;;) {
+            cache_overlap_pump();
             bool all = true;
             for (auto& w : workers) all = all && w->idle();
             if (!all && !halting && cancel && cancel()) {   // a Stop: the devices end the run early
@@ -8607,8 +8709,9 @@ struct Model::Impl {
                     progress(run.p0[reported - 1] + run.T[reported - 1] - run.p0[0]);
             }
             if (all) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(settle_running ? 1 : 50));
         }
+        settle_running = false;   // residual and late layers use the ordinary cache_tick/cache_settle below
         for (const std::string& e : errs)   // (a device's failure first: a Stop's early end is not one)
             if (!e.empty() && e != kHalted) {
                 err = e;
@@ -8732,6 +8835,7 @@ struct Model::Impl {
             lm_end_.on = false;
         }
         cache_settle();
+        settle_finish();   // also commits budget-limited residual before its per-run events go away
         const int nr = std::min(T_last, tap_cap);
         if (!seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
