@@ -1509,6 +1509,14 @@ int main(int argc, char** argv) {
                      (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
                      (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                      (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
+        double detail = 0.0;
+        for (int i = 6; i < 12; ++i) detail += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
+        if (detail > 0.0)
+            std::fprintf(stderr, "GPU attention per token (DS4_PROF): %.2f ms - Engram + mHC %.2f, input projections %.2f, "
+                                 "q_b + rope %.2f, compressor + indexer %.2f, sparse attention %.2f, output + hc_post %.2f\n",
+                         detail, (s.prof_ms[6] - s0.prof_ms[6]) / pt, (s.prof_ms[7] - s0.prof_ms[7]) / pt,
+                         (s.prof_ms[8] - s0.prof_ms[8]) / pt, (s.prof_ms[9] - s0.prof_ms[9]) / pt,
+                         (s.prof_ms[10] - s0.prof_ms[10]) / pt, (s.prof_ms[11] - s0.prof_ms[11]) / pt);
     }
     if (df != nullptr) std::fclose(df);
     m.save_profile();
