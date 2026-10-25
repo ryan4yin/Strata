@@ -1182,8 +1182,8 @@ void bf_rw(const BfJobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 }
 void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
     if (nj == 0) return;
-    if (f == 0 && vec) {   // BF16, 16-byte aligned: several rows a warp for a window
-        const int rw = bf_rows(max_c);
+    if (f == 0 && vec) {   // BF16, 16-byte aligned: several rows a warp for a window (Q8_0 two rows: mixed, d_wq_b
+        const int rw = bf_rows(max_c);   // T=5 86 -> 107 us, not taken)
         if (rw == 4) return bf_rw<4>(J, nj, max_n, max_c, s);
         if (rw == 2) return bf_rw<2>(J, nj, max_n, max_c, s);
     }
@@ -1622,7 +1622,8 @@ int mv_bench(int dev, bool check) {
                     {"wo_b Q5K", kFmtGG, iq::kQ5_K, 5120, 8192, 1},   {"sh_w1w3 Q5K", kFmtGG, iq::kQ5_K, 2304, 5120, 2},
                     {"sh_w2 Q5K", kFmtGG, iq::kQ5_K, 5120, 2304, 1},  {"wq_a+wkv Q8", kFmtQ8_0, 0, 1280, 5120, 1},
                     {"cmp BF16", kFmtBF16, 0, 512, 5120, 1},          {"idx_wq_b BF16", kFmtBF16, 0, 4096, 1280, 1},
-                    {"gate BF16", kFmtBF16, 0, 384, 5120, 1}};
+                    {"gate BF16", kFmtBF16, 0, 384, 5120, 1},          {"d_wq_b Q8", kFmtQ8_0, 0, 32768, 1280, 1},
+                    {"d_wo_b Q8", kFmtQ8_0, 0, 5120, 8192, 1},         {"d_proj Q8", kFmtQ8_0, 0, 5120, 15360, 1}};
     const int nm = (int) (sizeof(ms) / sizeof(ms[0]));
     auto rowb = [](const M& m, int k) { return m.fmt == kFmtGG ? type_row_bytes(m.type, k) : m.fmt == kFmtQ8_0 ? (size_t) k / 32 * 34 : (size_t) k * 2; };
     auto fill = [](std::vector<uint8_t>& h, const M& m, uint32_t seed) {
@@ -1730,6 +1731,22 @@ int mv_bench(int dev, bool check) {
     const int seq[] = {5, 0, 6, 7, 1, 2, 8, 3, 4};   // a layer's order (approximately)
     for (int T : {1, 2, 3, 4, 5, 6, 8}) {
         double total = 0;
+        for (int i = 9; i < nm; ++i) {   // (the drafter's: alone, not in the layer)
+            const int reps = 4 * (int) copies[i].size();
+            jobs_of(i, T, 0, js);
+            gguf::mv(js.data(), (int) js.size(), s);
+            cudaEventRecord(a, s);
+            for (int r = 0; r < reps; ++r) {
+                jobs_of(i, T, r, js);
+                gguf::mv(js.data(), (int) js.size(), s);
+            }
+            cudaEventRecord(b, s);
+            cudaEventSynchronize(b);
+            float ms_ = 0;
+            cudaEventElapsedTime(&ms_, a, b);
+            const double us = ms_ * 1000.0 / reps;
+            std::printf("T=%d %-14s jobs %d %8.2f us %7.1f GB/s\n", T, ms[i].name, 1, us, (double) ms[i].n * rowb(ms[i], ms[i].k) / us / 1e3);
+        }
         for (int i : seq) {
             const int reps = 4 * (int) copies[i].size();
             jobs_of(i, T, 0, js);
