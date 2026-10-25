@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 #include <mutex>
 #include <cstdio>
 
@@ -2387,6 +2388,28 @@ void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, 
     if (T > keep && b.n > 0)
         ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep,
                                                                              kv_row_bytes(kKvFp8, d));
+}
+// grid (blocks, copies): copy blockIdx.y, grid-stride
+__global__ void copy_batch_kernel(const CopyBatch b) {
+    const int j = blockIdx.y;
+    const uint8_t* src = (const uint8_t*) b.src[j];
+    uint8_t* dst = (uint8_t*) b.dst[j];
+    const size_t n = b.bytes[j], step = (size_t) gridDim.x * blockDim.x;
+    const size_t t0 = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if ((((uintptr_t) src | (uintptr_t) dst) & 15) == 0) {
+        const size_t n16 = n / 16;
+        for (size_t i = t0; i < n16; i += step) ((uint4*) dst)[i] = ((const uint4*) src)[i];
+        for (size_t i = n16 * 16 + t0; i < n; i += step) dst[i] = src[i];
+    } else {
+        for (size_t i = t0; i < n; i += step) dst[i] = src[i];
+    }
+}
+void copy_batch(const CopyBatch& b, cudaStream_t s) {
+    if (b.n <= 0) return;
+    size_t mx = 0;
+    for (int j = 0; j < b.n; ++j) mx = std::max(mx, b.bytes[j]);
+    const int blocks = (int) std::min<size_t>(128, std::max<size_t>(1, (mx / 16 + kThreads - 1) / kThreads));
+    copy_batch_kernel<<<dim3(blocks, b.n), kThreads, 0, s>>>(b);
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);

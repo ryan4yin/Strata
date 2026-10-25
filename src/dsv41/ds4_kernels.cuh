@@ -178,6 +178,21 @@ struct RingBatch {
     int n = 0;
 };
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+/// Up to kMaxCopyBatch device-to-device copies in one launch: the same bytes as a cudaMemcpyAsync each (16-byte units
+/// where source, destination and size allow, bytes otherwise), one kernel instead of one a copy.
+constexpr int kMaxCopyBatch = 64;
+struct CopyBatch {
+    const void* src[kMaxCopyBatch] = {};
+    void* dst[kMaxCopyBatch] = {};
+    size_t bytes[kMaxCopyBatch] = {};
+    int n = 0;
+    void add(void* d, const void* s, size_t b) {
+        dst[n] = d;
+        src[n] = s;
+        bytes[n++] = b;
+    }
+};
+void copy_batch(const CopyBatch& b, cudaStream_t s);
 
 /// Engram.  rows: n rows of hd values -> out F32 [n * hd].  fmt, the pack's row layout: 0 FP8 E4M3 values with E8M0
 /// scales (scales: n x (hd / 32)); 1 ggml Q6_K superblocks (hd / 256 of 210 bytes at the start of each row's hd bytes;

@@ -929,6 +929,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (s.drafts_rounds > s_dec.drafts_rounds) {   // (where a round's time goes, the CPU lane's share of it)
+            const double nr = (double) (s.drafts_rounds - s_dec.drafts_rounds);
+            const double ne = (double) (s.cpu_entries - s_dec.cpu_entries);
+            std::fprintf(stderr, "maya ds4 serve: per round: draft %.2f ms, verify %.2f ms, CPU lane %.2f ms (%.1f experts, %.2f tokens an expert)\n",
+                         (s.draft_ms - s_dec.draft_ms) / nr, (s.verify_ms - s_dec.verify_ms) / nr, (s.cpu_ms - s_dec.cpu_ms) / nr,
+                         ne / nr, ne > 0 ? (double) (s.cpu_experts - s_dec.cpu_experts) / ne : 0.0);
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
