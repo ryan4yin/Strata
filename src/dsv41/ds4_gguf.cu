@@ -1609,6 +1609,35 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
 // (each call type cycles through >= 256 MB of copies: DRAM, not the Infinity Cache); check: the window kernels against the
 // one-row ones, bit for bit
 namespace strata::ds4::gguf {
+__global__ void gap_kernel(float* p, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = p[i] * 0.5f + 1.0f;
+}
+// (dev) --mv-bench DEV gap: back-to-back dependent launches on one stream, us a launch (the GPU's dispatch gap)
+int gap_bench(int dev) {
+    cudaSetDevice(dev);
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    float* p = nullptr;
+    cudaMalloc(&p, 1 << 20);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    for (int blocks : {1, 64, 1024}) {
+        for (int i = 0; i < 200; ++i) gap_kernel<<<blocks, 256, 0, s>>>(p, blocks * 256);
+        cudaStreamSynchronize(s);
+        const int n = 4000;
+        cudaEventRecord(a, s);
+        for (int i = 0; i < n; ++i) gap_kernel<<<blocks, 256, 0, s>>>(p, blocks * 256);
+        cudaEventRecord(b, s);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("device %d: %4d blocks: %.2f us a launch\n", dev, blocks, ms * 1000.0f / n);
+    }
+    cudaFree(p);
+    return 0;
+}
 int mv_bench(int dev, bool check) {
     cudaSetDevice(dev);
     cudaStream_t s;
