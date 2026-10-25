@@ -114,8 +114,15 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     }
     return v;
 }
-// each NUMA node's physical cores (the first logical CPU of each core), in order
+// each NUMA node's physical cores (the first logical CPU of each core), in order.  STRATA_DS4_LANE_CPUS=list (e.g.
+// 0-7,8,9,12,13): one node of exactly these, in this order - the first is the lane's service thread's, the next ones the
+// workers' (--cpu-threads of them): on a hybrid CPU, which E-cores, e.g. spread over their clusters (a cluster's four
+// share an L2 and a ring stop)
 std::vector<std::vector<int>> node_cores() {
+    if (const char* v = std::getenv("STRATA_DS4_LANE_CPUS"); v != nullptr && *v != 0) {
+        std::vector<int> c = cpu_list(v);
+        if (!c.empty()) return {c};
+    }
 #if defined(_WIN32)
     static const bool smt = [] {   // DS4_CPU_SMT=1: the second hardware thread of every core as well (memory-bound rows gain from it)
         const char* v = std::getenv("DS4_CPU_SMT");
@@ -6686,6 +6693,7 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                    st.cpu_entries += (int64_t) ents.size();
                 }
             }
             std::atomic_thread_fence(std::memory_order_release);
@@ -7081,15 +7089,34 @@ struct Model::Impl {
                 cudaSetDevice(devs[di].id);
                 ring_restore_batch(rb[di], p0, g.win, keep, T, g.hd, devs[di].st);
             }
+        // the compressors' state: each device's snapshots back in one launch (a layer's copies touch only its own
+        // state), then each layer's accepted rows compressed again on the same stream
+        std::vector<CopyBatch> cb(devs.size());
+        for (int il = 0; il < g.nl; ++il)
+            for (int m = 0; m < L[(size_t) il].nm; ++m) {
+                Layer& l = member(L[(size_t) il], m);
+                if (l.c_snap == nullptr) continue;
+                CopyBatch& b = cb[(size_t) l.dev];
+                if (b.n + 2 > kMaxCopyBatch) {
+                    cudaSetDevice(devs[(size_t) l.dev].id);
+                    copy_batch(b, devs[(size_t) l.dev].st);
+                    b.n = 0;
+                }
+                const size_t ns = (size_t) l.ratio * g.hd * 4;
+                b.add(l.c_kv, l.c_snap, ns);
+                b.add(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns);
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (cb[di].n > 0) {
+                cudaSetDevice(devs[di].id);
+                copy_batch(cb[di], devs[di].st);
+            }
         for (int il = 0; il < g.nl; ++il)
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 Dev& d = devs[(size_t) l.dev];
                 if (l.c_snap != nullptr) {
                     cudaSetDevice(d.id);
-                    const size_t ns = (size_t) l.ratio * g.hd * 4;
-                    cudaMemcpyAsync(l.c_kv, l.c_snap, ns, cudaMemcpyDeviceToDevice, d.st);
-                    cudaMemcpyAsync(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns, cudaMemcpyDeviceToDevice, d.st);
                     compress_win(l.c_rows, l.c_rows + (size_t) kWin * g.hd, l.c_kv, l.c_score, l.ratio, (int) p0, keep,
                                  g.hd, l.c_norm, g.eps, d.latent, d.st);
                 }
@@ -8997,12 +9024,14 @@ struct Model::Impl {
                     finish(d.ckr, T, HD, HD, fc, s);
                     CK(cudaMemcpyAsync(d.latent, d.ckr, (size_t) T * HD * 4, cudaMemcpyDeviceToDevice, s));
                 } else {
-                    if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
+                    if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected (one launch)
                         const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
-                        CK(cudaMemcpyAsync(l.c_snap, l.c_kv, ns, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_snap + (size_t) R * HD, l.c_score, ns, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_rows, d.ckr, nr, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * HD, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
+                        CopyBatch cb;
+                        cb.add(l.c_snap, l.c_kv, ns);
+                        cb.add(l.c_snap + (size_t) R * HD, l.c_score, ns);
+                        cb.add(l.c_rows, d.ckr, nr);
+                        cb.add(l.c_rows + (size_t) kWin * HD, d.cgr, nr);
+                        copy_batch(cb, s);
                     }
                     compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
                 }
