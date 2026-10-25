@@ -1184,8 +1184,13 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 #define DS4_BUILD_ID "unknown"
 #endif
 
+namespace strata::ds4::gguf {
+int mv_bench(int dev);   // (dev) ds4_gguf.cu
+}
+
 int main(int argc, char** argv) {
     strata::ds4::os::fine_timer();
+    if (argc >= 2 && std::string(argv[1]) == "--mv-bench") return strata::ds4::gguf::mv_bench(argc >= 3 ? std::atoi(argv[2]) : 0);
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1";
     int n = 0, window = 0;   // (0: the model's feed unit - a whole prompt on the chunked path; 16 for the scoring runs)

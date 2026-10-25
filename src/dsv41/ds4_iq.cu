@@ -1267,11 +1267,20 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+// DS4_MV8=0: 5..8 activations through the 16-wide kernel (the release's choice)
+bool mv8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_MV8");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
     else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 8 && mv8_on()) mv_kernel<T, 8><<<grid, kThreads, 0, s>>>(J);   // (a verify window of 5..8)
     else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
 }
 

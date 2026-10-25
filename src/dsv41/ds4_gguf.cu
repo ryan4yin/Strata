@@ -200,6 +200,63 @@ void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, 
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
     q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
 }
+// one mv call's inputs in one launch: job j's rows at grid.y = j kMaxMvCols + r (q8_quant_kernel's operations)
+struct QJob {
+    const float* x;
+    size_t ldx;
+    int rows, k;
+    int8_t* q;
+    float* d;
+};
+struct QJobs {
+    QJob j[x3::kMaxMvJobs];
+};
+__global__ void __launch_bounds__(kThreads) q8_quant_jobs_kernel(const QJobs J) {
+    const QJob& a = J.j[blockIdx.y / x3::kMaxMvCols];
+    const int r = blockIdx.y % x3::kMaxMvCols, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (r >= a.rows || b * 32 >= a.k) return;
+    const float v = a.x[(size_t) r * a.ldx + (size_t) b * 32 + lane];
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    a.q[(size_t) r * a.k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if (lane == 0) a.d[(size_t) r * (a.k / 32) + b] = sc;
+}
+// DS4_QBATCH=0: each job's inputs a launch of their own (the release's way)
+bool qbatch_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_QBATCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+// the inputs of a call's jobs: once a distinct (x, ldx, rows, k) - a job reading the same rows as an earlier one reads
+// its int8 copy - and every one in a single launch
+struct QPlan {
+    QJobs J;
+    int n = 0, max_k = 0;
+    // the int8 rows and scales job i reads (a copy rounded already, or the slot at `at`)
+    void add(const float* x, size_t ldx, int rows, int k, int8_t*& q, float*& d, cudaStream_t s) {
+        if (!qbatch_on()) {
+            q8_quant(x, ldx, rows, k, q, d, s);
+            return;
+        }
+        for (int i = 0; i < n; ++i)
+            if (J.j[i].x == x && J.j[i].ldx == ldx && J.j[i].rows == rows && J.j[i].k == k) {
+                q = J.j[i].q;
+                d = J.j[i].d;
+                return;
+            }
+        J.j[n++] = QJob{x, ldx, rows, k, q, d};
+        max_k = std::max(max_k, k);
+    }
+    void launch(cudaStream_t s) {
+        if (n == 0) return;
+        const dim3 grid((unsigned) ((max_k / 32 + kWarps - 1) / kWarps), (unsigned) (n * x3::kMaxMvCols));
+        q8_quant_jobs_kernel<<<grid, kThreads, 0, s>>>(J);
+    }
+};
 
 // 8 E2M1 codes (a word of 4 code bytes) -> their values as int8: .x the low nibbles' (values 0..3 of the word's bytes),
 // .y the high nibbles' - llama.cpp's get_int_from_table_16 (MIT), the table kvalues_mxfp4
@@ -1077,6 +1134,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
+    QPlan qp;
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -1089,7 +1147,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            qp.add(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd, s);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1097,8 +1157,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
+            b.xq = xq;
+            b.xd = xd;
             b.y = q.y;
             b.ycs = q.y_cs;
             b.bias = q.bias;
@@ -1136,14 +1196,17 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            int8_t* xq = sc->mq + at;
+            float* xd = sc->md + at / 32;
+            qp.add(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, xq, xd, s);
+            b.xq = xq;
+            b.xd = xd;
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+    qp.launch(s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");
@@ -1466,4 +1529,117 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     check("set_down");
 }
 
+}  // namespace strata::ds4::gguf
+
+// ---- (dev) --mv-bench: the decode layer's dense GEMVs at their real shapes, T activations, alone and in sequence
+namespace strata::ds4::gguf {
+int mv_bench(int dev) {
+    cudaSetDevice(dev);
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    struct M { const char* name; int fmt, type, n, k; };
+    const M ms[] = {{"wq_b Q5K", kFmtGG, iq::kQ5_K, 32768, 1280}, {"wo_a Q5K", kFmtGG, iq::kQ5_K, 1024, 4096},
+                    {"wo_b Q5K", kFmtGG, iq::kQ5_K, 5120, 8192},   {"sh_w1 Q5K", kFmtGG, iq::kQ5_K, 2304, 5120},
+                    {"sh_w2 Q5K", kFmtGG, iq::kQ5_K, 5120, 2304},  {"wq_a Q8", kFmtQ8_0, 0, 1280, 5120},
+                    {"wkv Q8", kFmtQ8_0, 0, 512, 5120},           {"cmp BF16", kFmtBF16, 0, 512, 5120},
+                    {"idx_wq_b BF16", kFmtBF16, 0, 4096, 1280},   {"gate BF16", kFmtBF16, 0, 384, 5120}};
+    const int nm = (int) (sizeof(ms) / sizeof(ms[0]));
+    std::vector<x3::Mat> mats(nm * 8);
+    std::vector<void*> bufs;
+    auto rnd = [](std::vector<uint8_t>& v, uint32_t seed) { for (auto& b : v) { seed = seed * 1664525u + 1013904223u; b = (uint8_t) (seed >> 24); } };
+    for (int i = 0; i < nm; ++i)
+        for (int c = 0; c < (i == 1 ? 8 : 1); ++c) {
+            const M& m = ms[i];
+            x3::Mat& x = mats[i * 8 + c];
+            size_t rb = m.fmt == kFmtGG ? type_row_bytes(m.type, m.k) : m.fmt == kFmtQ8_0 ? (size_t) m.k / 32 * 34 : (size_t) m.k * 2;
+            std::vector<uint8_t> h(rb * m.n);
+            rnd(h, 7 + i * 31 + c);
+            if (m.fmt == kFmtGG) {   // Q5_K blocks of 176 bytes: d, dmin small halves
+                for (size_t o = 0; o < h.size(); o += 176) { const uint16_t d = 0x1400, dm = 0x1000; std::memcpy(&h[o], &d, 2); std::memcpy(&h[o + 2], &dm, 2); }
+            } else if (m.fmt == kFmtQ8_0) {
+                for (size_t o = 0; o < h.size(); o += 34) { const uint16_t d = 0x1400; std::memcpy(&h[o], &d, 2); }
+            } else {
+                for (size_t o = 0; o < h.size(); o += 2) h[o + 1] = (uint8_t) (0x3c ^ (h[o + 1] & 0x83));
+            }
+            void* dw = nullptr;
+            cudaMalloc(&dw, h.size());
+            cudaMemcpy(dw, h.data(), h.size(), cudaMemcpyHostToDevice);
+            bufs.push_back(dw);
+            x.fmt = m.fmt;
+            x.K = m.type;
+            x.raw = dw;
+            x.k = m.k;
+            x.n = m.n;
+        }
+    float *dx = nullptr, *dy = nullptr;
+    const size_t KX = 32768, NY = 32768;
+    cudaMalloc(&dx, 16 * KX * 4);
+    cudaMalloc(&dy, 16 * NY * 8 * 4);
+    std::vector<float> hx(16 * KX);
+    uint32_t sd = 1;
+    for (auto& v : hx) { sd = sd * 1664525u + 1013904223u; v = ((int) (sd >> 9) % 2001 - 1000) * 1e-3f; }
+    cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    // the calls of one decode layer, as the engine makes them (wo_a: 8 jobs; w1 + w3 one call; wq_a + wkv one call)
+    auto jobs_of = [&](int i, int T, std::vector<x3::MvJob>& js) {
+        js.clear();
+        const M& m = ms[i];
+        const int nj = i == 1 ? 8 : (i == 3 ? 2 : 1);
+        for (int c = 0; c < nj; ++c) {
+            x3::MvJob j;
+            j.m = &mats[i == 3 ? i * 8 : i * 8 + c];
+            j.xf = i == 1 ? dx + (size_t) c * m.k : dx;
+            j.xf_cs = i == 1 ? (size_t) 8 * m.k : (size_t) m.k;
+            j.y = dy + (size_t) c * NY * 16;
+            j.y_cs = (size_t) m.n;
+            j.ncol = T;
+            js.push_back(j);
+        }
+        if (i == 5) {   // wq_a + wkv: the same input
+            x3::MvJob j = js[0];
+            j.m = &mats[6 * 8];
+            j.y = dy + (size_t) NY * 16;
+            j.y_cs = 512;
+            js.push_back(j);
+        }
+    };
+    const int seq[] = {5, 0, 7, 8, 1, 2, 9, 3, 4};   // a layer's order (approximately)
+    std::vector<x3::MvJob> js;
+    for (int T : {1, 2, 3, 4, 5, 6, 8}) {
+        double total = 0;
+        for (int i : seq) {
+            jobs_of(i, T, js);
+            gguf::mv(js.data(), (int) js.size(), s);
+            cudaStreamSynchronize(s);
+            cudaEventRecord(a, s);
+            for (int r = 0; r < 50; ++r) gguf::mv(js.data(), (int) js.size(), s);
+            cudaEventRecord(b, s);
+            cudaEventSynchronize(b);
+            float ms_ = 0;
+            cudaEventElapsedTime(&ms_, a, b);
+            double bytes = 0;
+            for (auto& j : js) bytes += (double) j.m->n * (j.m->fmt == kFmtGG ? type_row_bytes(j.m->K, j.m->k) : j.m->fmt == kFmtQ8_0 ? (size_t) j.m->k / 32 * 34 : (size_t) j.m->k * 2);
+            const double us = ms_ * 1000.0 / 50;
+            total += us;
+            std::printf("T=%d %-14s jobs %d %8.2f us %7.1f GB/s\n", T, ms[i].name, (int) js.size(), us, bytes / us / 1e3);
+        }
+        cudaEventRecord(a, s);
+        for (int r = 0; r < 20; ++r)
+            for (int i : seq) {
+                jobs_of(i, T, js);
+                gguf::mv(js.data(), (int) js.size(), s);
+            }
+        cudaEventRecord(b, s);
+        cudaEventSynchronize(b);
+        float ms_ = 0;
+        cudaEventElapsedTime(&ms_, a, b);
+        std::printf("T=%d layer: sum of alone %.1f us, in sequence %.1f us\n", T, total, ms_ * 1000.0 / 20);
+    }
+    for (void* p : bufs) cudaFree(p);
+    cudaFree(dx);
+    cudaFree(dy);
+    return 0;
+}
 }  // namespace strata::ds4::gguf
