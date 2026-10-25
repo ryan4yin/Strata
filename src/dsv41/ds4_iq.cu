@@ -932,6 +932,54 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+// RW rows a warp (rows RW w .. RW w + RW - 1), each with mv_kernel's lane -> sub-block mapping and FMA order (the same
+// bits), the activations' int8 sub-blocks read once for the RW rows - a window's T activations are otherwise read again
+// for every row, several times the weights' bytes
+template <int T, int NC, int RW>
+__global__ void __launch_bounds__(kThreads) mv_rw_kernel(const Jobs J) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    load_tab<T>(tab);
+    __syncthreads();
+    const MvJob& b = J.j[blockIdx.y];
+    const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * RW, lane = threadIdx.x & 31;
+    if (row0 >= b.n) return;
+    const int nsb = b.k / 32, nr = min(RW, b.n - row0);
+    float acc[RW][NC];
+#pragma unroll
+    for (int r = 0; r < RW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    for (int kb = lane; kb < nsb; kb += 32) {
+        int4 xa[NC], xb[NC];
+        float xd[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                xa[c] = xp[0];
+                xb[c] = xp[1];
+                xd[c] = b.xd[(size_t) c * nsb + kb];
+            }
+#pragma unroll
+        for (int r = 0; r < RW; ++r)
+            if (r < nr) {
+                Sub s;
+                decode<T>(b.w + (size_t) (row0 + r) * b.ld, kb, tab, s);
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) acc[r][c] = fmaf(xd[c], sub_dot<T>(s, xa[c], xb[c]), acc[r][c]);
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < RW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (r < nr && c < b.ncol) {
+                const float v = warp_sum(acc[r][c]);
+                if (lane == 0) b.y[c * b.ycs + row0 + r] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + r] : 0.0f);
+            }
+}
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1276,8 +1324,33 @@ bool mv8_on() {
     }();
     return on;
 }
+// rows a warp for a call of max_c activations over max_n rows (DS4_MV_RW=n forces n; 1: the one-row kernel)
+int g_rw_force = -1;   // (set_rw_force: the bench's reference runs)
+int mv_rows(int max_k, int max_c) {
+    if (g_rw_force < 0) g_rw_force = std::getenv("DS4_MV_RW") ? std::atoi(std::getenv("DS4_MV_RW")) : 0;
+    const int force = g_rw_force;
+    if (force > 0) return force >= 4 ? 4 : force >= 2 ? 2 : 1;
+    // (R9700, DRAM-bound bench: 2 rows beat 1 and 4 for a window, except at short rows - wq_b's 40 sub-blocks leave
+    // most lanes one step, and a second row only halves the warps)
+    return max_c <= 1 || max_k < 2048 ? 1 : 2;
+}
+template <int T, int RW>
+void mv_rw(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    const dim3 grid((unsigned) ((max_n + kWarps * RW - 1) / (kWarps * RW)), (unsigned) nj);
+    if (max_c <= 2) mv_rw_kernel<T, 2, RW><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 4) mv_rw_kernel<T, 4, RW><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 8) mv_rw_kernel<T, 8, RW><<<grid, kThreads, 0, s>>>(J);
+    else mv_rw_kernel<T, 16, RW><<<grid, kThreads, 0, s>>>(J);
+}
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    if constexpr (T == kQ5_K || T == kQ6_K) {   // (the dense matrices: a window's activations against many rows)
+        int max_k = 0;
+        for (int i = 0; i < nj; ++i) max_k = std::max(max_k, J.j[i].k);
+        const int rw = mv_rows(max_k, max_c);
+        if (rw == 4) return mv_rw<T, 4>(J, nj, max_n, max_c, s);
+        if (rw == 2) return mv_rw<T, 2>(J, nj, max_n, max_c, s);
+    }
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
     else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
@@ -1597,6 +1670,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
     return true;
 }
 
+void set_rw_force(int rw) { g_rw_force = rw; }
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     {   // the trellis jobs go to their kernels, the others on
         MvJob tqj[64], oth[64];
