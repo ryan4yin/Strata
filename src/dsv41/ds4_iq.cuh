@@ -119,6 +119,8 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// (bench) rows a warp of the dense GEMV forced to rw (1: the one-row kernel; 0: by shape; -1: DS4_MV_RW)
+void set_rw_force(int rw);
 
 /// n rows of k values of a matrix of the type (ld bytes a row) as BF16 (bf16) or F16 bits, dst[n][k]: the chunked prompt path's
 /// dense GEMM operand.  false: a type not covered.
