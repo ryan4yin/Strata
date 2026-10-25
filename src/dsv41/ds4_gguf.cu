@@ -16,6 +16,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <vector>
 #include <mutex>
 #include <unordered_map>
 
@@ -114,6 +116,61 @@ __global__ void __launch_bounds__(kThreads) bf16_mv_kernel(const BfJobs J) {
         }
 }
 
+// bf16_mv_kernel's VEC form with RW rows a warp: each row's lanes, steps and FMA order as there (the same bits), a step's
+// activations loaded once for the RW rows
+template <int NC, int RW>
+__global__ void __launch_bounds__(kThreads) bf16_mv_rw_kernel(const BfJobs J) {
+    const BfJob& b = J.j[blockIdx.y];
+    const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * RW, lane = threadIdx.x & 31;
+    if (row0 >= b.n) return;
+    const int nr = min(RW, b.n - row0);
+    float acc[RW][NC];
+#pragma unroll
+    for (int r = 0; r < RW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    for (int i = lane * 8; i < b.k; i += 256) {
+        float4 x0[NC], x1[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (c < b.ncol) {
+                const float4* xp = (const float4*) (b.x + c * b.xcs + i);
+                x0[c] = __ldg(xp);
+                x1[c] = __ldg(xp + 1);
+            }
+#pragma unroll
+        for (int r = 0; r < RW; ++r)
+            if (r < nr) {
+                const uint4 q = *(const uint4*) ((const uint16_t*) b.w + (size_t) (row0 + r) * b.ld + i);
+                const float wf[8] = {__uint_as_float(q.x << 16), __uint_as_float(q.x & 0xffff0000u),
+                                     __uint_as_float(q.y << 16), __uint_as_float(q.y & 0xffff0000u),
+                                     __uint_as_float(q.z << 16), __uint_as_float(q.z & 0xffff0000u),
+                                     __uint_as_float(q.w << 16), __uint_as_float(q.w & 0xffff0000u)};
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < b.ncol) {
+                        float a = acc[r][c];
+                        a = fmaf(wf[0], x0[c].x, a);
+                        a = fmaf(wf[1], x0[c].y, a);
+                        a = fmaf(wf[2], x0[c].z, a);
+                        a = fmaf(wf[3], x0[c].w, a);
+                        a = fmaf(wf[4], x1[c].x, a);
+                        a = fmaf(wf[5], x1[c].y, a);
+                        a = fmaf(wf[6], x1[c].z, a);
+                        a = fmaf(wf[7], x1[c].w, a);
+                        acc[r][c] = a;
+                    }
+            }
+    }
+#pragma unroll
+    for (int r = 0; r < RW; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (r < nr && c < b.ncol) {
+                const float v = warp_sum(acc[r][c]);
+                if (lane == 0) b.y[c * b.ycs + row0 + r] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + r] : 0.0f);
+            }
+}
 
 __global__ void q8_rows_kernel(const uint8_t* __restrict__ w, size_t ld, int k, int n, uint16_t* __restrict__ dst,
                                bool bf16) {
@@ -1107,8 +1164,29 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         else bf16_mv_kernel<NC, false><<<grid, kThreads, 0, s>>>(J);
     }
 }
+// rows a warp for the BF16 kernel (DS4_BF_RW=n forces n; 1: the one-row kernel)
+int g_bf_force = -1;
+int bf_rows(int max_c) {
+    if (g_bf_force < 0) g_bf_force = std::getenv("DS4_BF_RW") ? std::atoi(std::getenv("DS4_BF_RW")) : 0;
+    const int force = g_bf_force;
+    if (force > 0) return force >= 4 ? 4 : force >= 2 ? 2 : 1;
+    return max_c <= 1 ? 1 : 2;   // (R9700: 2 rows beat 1 and 4 at every window shape of the layer)
+}
+template <int RW>
+void bf_rw(const BfJobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    const dim3 grid((unsigned) ((max_n + kWarps * RW - 1) / (kWarps * RW)), (unsigned) nj);
+    if (max_c <= 2) bf16_mv_rw_kernel<2, RW><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 4) bf16_mv_rw_kernel<4, RW><<<grid, kThreads, 0, s>>>(J);
+    else if (max_c <= 8) bf16_mv_rw_kernel<8, RW><<<grid, kThreads, 0, s>>>(J);
+    else bf16_mv_rw_kernel<16, RW><<<grid, kThreads, 0, s>>>(J);
+}
 void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
     if (nj == 0) return;
+    if (f == 0 && vec) {   // BF16, 16-byte aligned: several rows a warp for a window
+        const int rw = bf_rows(max_c);
+        if (rw == 4) return bf_rw<4>(J, nj, max_n, max_c, s);
+        if (rw == 2) return bf_rw<2>(J, nj, max_n, max_c, s);
+    }
     if (max_c <= 1) mv_launch<1>(f, J, nj, max_n, vec, s);
     else if (max_c <= 2) mv_launch<2>(f, J, nj, max_n, vec, s);
     else if (max_c <= 4) mv_launch<4>(f, J, nj, max_n, vec, s);
@@ -1531,111 +1609,159 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
 
 }  // namespace strata::ds4::gguf
 
-// ---- (dev) --mv-bench: the decode layer's dense GEMVs at their real shapes, T activations, alone and in sequence
+// ---- (dev) --mv-bench [check]: the decode layer's dense GEMVs at their real shapes, T activations, alone and in sequence
+// (each call type cycles through >= 256 MB of copies: DRAM, not the Infinity Cache); check: the window kernels against the
+// one-row ones, bit for bit
 namespace strata::ds4::gguf {
-int mv_bench(int dev) {
+int mv_bench(int dev, bool check) {
     cudaSetDevice(dev);
     cudaStream_t s;
     cudaStreamCreate(&s);
-    struct M { const char* name; int fmt, type, n, k; };
-    const M ms[] = {{"wq_b Q5K", kFmtGG, iq::kQ5_K, 32768, 1280}, {"wo_a Q5K", kFmtGG, iq::kQ5_K, 1024, 4096},
-                    {"wo_b Q5K", kFmtGG, iq::kQ5_K, 5120, 8192},   {"sh_w1 Q5K", kFmtGG, iq::kQ5_K, 2304, 5120},
-                    {"sh_w2 Q5K", kFmtGG, iq::kQ5_K, 5120, 2304},  {"wq_a Q8", kFmtQ8_0, 0, 1280, 5120},
-                    {"wkv Q8", kFmtQ8_0, 0, 512, 5120},           {"cmp BF16", kFmtBF16, 0, 512, 5120},
-                    {"idx_wq_b BF16", kFmtBF16, 0, 4096, 1280},   {"gate BF16", kFmtBF16, 0, 384, 5120}};
+    struct M { const char* name; int fmt, type, n, k, jobs; };
+    const M ms[] = {{"wq_b Q5K", kFmtGG, iq::kQ5_K, 32768, 1280, 1}, {"wo_a Q5K", kFmtGG, iq::kQ5_K, 1024, 4096, 8},
+                    {"wo_b Q5K", kFmtGG, iq::kQ5_K, 5120, 8192, 1},   {"sh_w1w3 Q5K", kFmtGG, iq::kQ5_K, 2304, 5120, 2},
+                    {"sh_w2 Q5K", kFmtGG, iq::kQ5_K, 5120, 2304, 1},  {"wq_a+wkv Q8", kFmtQ8_0, 0, 1280, 5120, 1},
+                    {"cmp BF16", kFmtBF16, 0, 512, 5120, 1},          {"idx_wq_b BF16", kFmtBF16, 0, 4096, 1280, 1},
+                    {"gate BF16", kFmtBF16, 0, 384, 5120, 1}};
     const int nm = (int) (sizeof(ms) / sizeof(ms[0]));
-    std::vector<x3::Mat> mats(nm * 8);
-    std::vector<void*> bufs;
-    auto rnd = [](std::vector<uint8_t>& v, uint32_t seed) { for (auto& b : v) { seed = seed * 1664525u + 1013904223u; b = (uint8_t) (seed >> 24); } };
-    for (int i = 0; i < nm; ++i)
-        for (int c = 0; c < (i == 1 ? 8 : 1); ++c) {
-            const M& m = ms[i];
-            x3::Mat& x = mats[i * 8 + c];
-            size_t rb = m.fmt == kFmtGG ? type_row_bytes(m.type, m.k) : m.fmt == kFmtQ8_0 ? (size_t) m.k / 32 * 34 : (size_t) m.k * 2;
-            std::vector<uint8_t> h(rb * m.n);
-            rnd(h, 7 + i * 31 + c);
-            if (m.fmt == kFmtGG) {   // Q5_K blocks of 176 bytes: d, dmin small halves
-                for (size_t o = 0; o < h.size(); o += 176) { const uint16_t d = 0x1400, dm = 0x1000; std::memcpy(&h[o], &d, 2); std::memcpy(&h[o + 2], &dm, 2); }
-            } else if (m.fmt == kFmtQ8_0) {
-                for (size_t o = 0; o < h.size(); o += 34) { const uint16_t d = 0x1400; std::memcpy(&h[o], &d, 2); }
-            } else {
-                for (size_t o = 0; o < h.size(); o += 2) h[o + 1] = (uint8_t) (0x3c ^ (h[o + 1] & 0x83));
-            }
-            void* dw = nullptr;
-            cudaMalloc(&dw, h.size());
-            cudaMemcpy(dw, h.data(), h.size(), cudaMemcpyHostToDevice);
-            bufs.push_back(dw);
-            x.fmt = m.fmt;
-            x.K = m.type;
-            x.raw = dw;
-            x.k = m.k;
-            x.n = m.n;
+    auto rowb = [](const M& m, int k) { return m.fmt == kFmtGG ? type_row_bytes(m.type, k) : m.fmt == kFmtQ8_0 ? (size_t) k / 32 * 34 : (size_t) k * 2; };
+    auto fill = [](std::vector<uint8_t>& h, const M& m, uint32_t seed) {
+        for (auto& b : h) { seed = seed * 1664525u + 1013904223u; b = (uint8_t) (seed >> 24); }
+        if (m.fmt == kFmtGG) {
+            for (size_t o = 0; o < h.size(); o += 176) { const uint16_t d = 0x1400, dm = 0x1000; std::memcpy(&h[o], &d, 2); std::memcpy(&h[o + 2], &dm, 2); }
+        } else if (m.fmt == kFmtQ8_0) {
+            for (size_t o = 0; o < h.size(); o += 34) { const uint16_t d = 0x1400; std::memcpy(&h[o], &d, 2); }
+        } else {
+            for (size_t o = 0; o < h.size(); o += 2) h[o + 1] = (uint8_t) (0x3c ^ (h[o + 1] & 0x83));
         }
+    };
+    // copies[i]: the call's matrices (jobs of them, plus wkv for wq_a) repeated to >= 256 MB (1 copy for check)
+    std::vector<std::vector<std::vector<x3::Mat>>> copies(nm);
+    std::vector<void*> bufs;
+    for (int i = 0; i < nm; ++i) {
+        const M& m = ms[i];
+        const size_t bytes = rowb(m, m.k) * m.n * m.jobs;
+        const int nc = check ? 1 : (int) std::max<size_t>(1, (256u << 20) / bytes + 1);
+        for (int c = 0; c < nc; ++c) {
+            std::vector<x3::Mat> mats;
+            for (int j = 0; j < m.jobs + (i == 5 ? 1 : 0); ++j) {
+                const int n = i == 5 && j == 1 ? 512 : m.n;
+                std::vector<uint8_t> h(rowb(m, m.k) * n);
+                fill(h, m, 7 + i * 31 + j * 7 + c * 1013);
+                void* dw = nullptr;
+                if (cudaMalloc(&dw, h.size()) != cudaSuccess) { std::fprintf(stderr, "alloc failed\n"); return 1; }
+                cudaMemcpy(dw, h.data(), h.size(), cudaMemcpyHostToDevice);
+                bufs.push_back(dw);
+                x3::Mat x;
+                x.fmt = m.fmt;
+                x.K = m.type;
+                x.raw = dw;
+                x.k = m.k;
+                x.n = n;
+                mats.push_back(x);
+            }
+            copies[i].push_back(mats);
+        }
+    }
     float *dx = nullptr, *dy = nullptr;
     const size_t KX = 32768, NY = 32768;
     cudaMalloc(&dx, 16 * KX * 4);
-    cudaMalloc(&dy, 16 * NY * 8 * 4);
+    cudaMalloc(&dy, 16 * NY * 9 * 4);
     std::vector<float> hx(16 * KX);
     uint32_t sd = 1;
-    for (auto& v : hx) { sd = sd * 1664525u + 1013904223u; v = ((int) (sd >> 9) % 2001 - 1000) * 1e-3f; }
+    for (auto& v : hx) {   // both signs, magnitudes over ~6 decades
+        sd = sd * 1664525u + 1013904223u;
+        const float mag = std::pow(10.0f, (float) ((sd >> 8) % 600) / 100.0f - 4.0f);
+        v = (sd & 1u) ? mag : -mag;
+    }
     cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    auto jobs_of = [&](int i, int T, int c, std::vector<x3::MvJob>& js) {
+        js.clear();
+        const M& m = ms[i];
+        const std::vector<x3::Mat>& mats = copies[i][(size_t) c % copies[i].size()];
+        for (size_t j = 0; j < mats.size(); ++j) {
+            x3::MvJob q;
+            q.m = &mats[j];
+            const bool own_x = i == 1;   // wo_a: each group its own slice of the attention output
+            q.xf = own_x ? dx + j * m.k : dx;
+            q.xf_cs = own_x ? (size_t) 8 * m.k : (size_t) m.k;
+            q.y = dy + j * NY * 16;
+            q.y_cs = (size_t) mats[j].n;
+            q.ncol = T;
+            js.push_back(q);
+        }
+    };
+    std::vector<x3::MvJob> js;
+    if (check) {
+        int fails = 0, cases = 0;
+        for (int i = 0; i < nm; ++i)
+            for (int T : {1, 2, 3, 4, 5, 6, 7, 8, 16}) {
+                jobs_of(i, T, 0, js);
+                std::vector<float> ref(16 * NY * 9), got(16 * NY * 9);
+                cudaMemset(dy, 0, 16 * NY * 9 * 4);
+                iq::set_rw_force(1);
+                g_bf_force = 1;
+                gguf::mv(js.data(), (int) js.size(), s);
+                cudaStreamSynchronize(s);
+                cudaMemcpy(ref.data(), dy, ref.size() * 4, cudaMemcpyDeviceToHost);
+                for (int rw : {0, 2, 4}) {
+                    cudaMemset(dy, 0, 16 * NY * 9 * 4);
+                    iq::set_rw_force(rw);
+                    g_bf_force = rw;
+                    gguf::mv(js.data(), (int) js.size(), s);
+                    cudaStreamSynchronize(s);
+                    cudaMemcpy(got.data(), dy, got.size() * 4, cudaMemcpyDeviceToHost);
+                    const bool ok = std::memcmp(ref.data(), got.data(), ref.size() * 4) == 0;
+                    bool finite = true;
+                    for (size_t q = 0; q < ref.size() && finite; ++q) finite = std::isfinite(ref[q]);
+                    ++cases;
+                    if (!ok) ++fails;
+                    if (!ok || !finite) std::printf("check %-14s T=%-2d rw=%d %s%s\n", ms[i].name, T, rw, ok ? "PASS" : "FAIL", finite ? "" : " (non-finite)");
+                }
+            }
+        iq::set_rw_force(-1);
+        g_bf_force = -1;
+        std::printf("check: %d cases, %d failed -> %s\n", cases, fails, fails ? "FAILED" : "ALL PASS");
+        return fails ? 1 : 0;
+    }
     cudaEvent_t a, b;
     cudaEventCreate(&a);
     cudaEventCreate(&b);
-    // the calls of one decode layer, as the engine makes them (wo_a: 8 jobs; w1 + w3 one call; wq_a + wkv one call)
-    auto jobs_of = [&](int i, int T, std::vector<x3::MvJob>& js) {
-        js.clear();
-        const M& m = ms[i];
-        const int nj = i == 1 ? 8 : (i == 3 ? 2 : 1);
-        for (int c = 0; c < nj; ++c) {
-            x3::MvJob j;
-            j.m = &mats[i == 3 ? i * 8 : i * 8 + c];
-            j.xf = i == 1 ? dx + (size_t) c * m.k : dx;
-            j.xf_cs = i == 1 ? (size_t) 8 * m.k : (size_t) m.k;
-            j.y = dy + (size_t) c * NY * 16;
-            j.y_cs = (size_t) m.n;
-            j.ncol = T;
-            js.push_back(j);
-        }
-        if (i == 5) {   // wq_a + wkv: the same input
-            x3::MvJob j = js[0];
-            j.m = &mats[6 * 8];
-            j.y = dy + (size_t) NY * 16;
-            j.y_cs = 512;
-            js.push_back(j);
-        }
-    };
-    const int seq[] = {5, 0, 7, 8, 1, 2, 9, 3, 4};   // a layer's order (approximately)
-    std::vector<x3::MvJob> js;
+    const int seq[] = {5, 0, 6, 7, 1, 2, 8, 3, 4};   // a layer's order (approximately)
     for (int T : {1, 2, 3, 4, 5, 6, 8}) {
         double total = 0;
         for (int i : seq) {
-            jobs_of(i, T, js);
+            const int reps = 4 * (int) copies[i].size();
+            jobs_of(i, T, 0, js);
             gguf::mv(js.data(), (int) js.size(), s);
             cudaStreamSynchronize(s);
             cudaEventRecord(a, s);
-            for (int r = 0; r < 50; ++r) gguf::mv(js.data(), (int) js.size(), s);
+            for (int r = 0; r < reps; ++r) {
+                jobs_of(i, T, r, js);
+                gguf::mv(js.data(), (int) js.size(), s);
+            }
             cudaEventRecord(b, s);
             cudaEventSynchronize(b);
             float ms_ = 0;
             cudaEventElapsedTime(&ms_, a, b);
             double bytes = 0;
-            for (auto& j : js) bytes += (double) j.m->n * (j.m->fmt == kFmtGG ? type_row_bytes(j.m->K, j.m->k) : j.m->fmt == kFmtQ8_0 ? (size_t) j.m->k / 32 * 34 : (size_t) j.m->k * 2);
-            const double us = ms_ * 1000.0 / 50;
+            for (auto& j : js) bytes += (double) j.m->n * rowb(ms[i], j.m->k);
+            const double us = ms_ * 1000.0 / reps;
             total += us;
             std::printf("T=%d %-14s jobs %d %8.2f us %7.1f GB/s\n", T, ms[i].name, (int) js.size(), us, bytes / us / 1e3);
         }
+        const int reps = 64;
         cudaEventRecord(a, s);
-        for (int r = 0; r < 20; ++r)
+        for (int r = 0; r < reps; ++r)
             for (int i : seq) {
-                jobs_of(i, T, js);
+                jobs_of(i, T, r, js);
                 gguf::mv(js.data(), (int) js.size(), s);
             }
         cudaEventRecord(b, s);
         cudaEventSynchronize(b);
         float ms_ = 0;
         cudaEventElapsedTime(&ms_, a, b);
-        std::printf("T=%d layer: sum of alone %.1f us, in sequence %.1f us\n", T, total, ms_ * 1000.0 / 20);
+        std::printf("T=%d layer: sum of alone %.1f us, in sequence %.1f us\n", T, total, ms_ * 1000.0 / reps);
     }
     for (void* p : bufs) cudaFree(p);
     cudaFree(dx);
