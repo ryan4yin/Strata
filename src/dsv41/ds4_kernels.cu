@@ -1848,7 +1848,7 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 namespace {
 
 // ---- the split-KV attention's scratch: a device allocation a (device, stream), made on first use and kept
-constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 8;   // (8: a verify window of 6)
 bool split_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("DS4_ATTN_SPLIT");
