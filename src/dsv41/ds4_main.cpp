@@ -1254,11 +1254,16 @@ int spec_eval(strata::ds4::Model& m, const std::string& ids_path, int n, int win
 #define DS4_BUILD_ID "unknown"
 #endif
 
+namespace strata::ds4::gguf {
+int mv_bench(int dev);   // (dev) ds4_gguf.cu
+}
+
 #if defined(STRATA_METAL)
 #include "sampler_stat.inc"
 #endif
 int main(int argc, char** argv) {
     strata::ds4::os::fine_timer();
+    if (argc >= 2 && std::string(argv[1]) == "--mv-bench") return strata::ds4::gguf::mv_bench(argc >= 3 ? std::atoi(argv[2]) : 0);
 #if defined(STRATA_METAL)
     if (argc > 1 && std::string(argv[1]) == "--sampler-test") return sampler_stat::run(argc - 1, argv + 1);   // (the sampler's statistics harness)
 #endif
