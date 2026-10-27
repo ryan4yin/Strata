@@ -2784,7 +2784,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2_use, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            grouped(p_ptr2_use, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             // STRATA_FUSE_COMBINE: the hits-added combine below waits for the CPU's rows and reads them where they are
             fuse_comb = comb_fusable(n, tb);
