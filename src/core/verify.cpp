@@ -1835,7 +1835,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return v != nullptr && std::atoi(v) != 0;
                 }();
                 bool gdn_q8 = false;   // STRATA_FUSE_GDNQ8: xq_ written by the recurrence below
-                if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
+                // (not when the window keeps its rows, STRATA_BATCH_SELF_COMMIT: the grouped kernel's commit mode writes no
+                // outputs, so such a window takes the per-slot path below, which commits one row a slot)
+                if (batch_rec_ && gdn_groups_on && !keep_rows && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
                     const bool defer = defer_on() && tb == 0 && te == T;   // STRATA_FUSE_GDNDEFER: one group of rows
                     for (int t = tb; t < te;) {
