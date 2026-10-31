@@ -52,27 +52,6 @@ class Config(unittest.TestCase):
     def test_cpu_sets_off(self):
         self.assertIsNone(cpu_sets(2, enabled=False))
         self.assertIsNone(cpu_sets(1))
-        self.assertIsNone(cpu_sets(2, enabled=None))
-
-    def test_cpu_sets_automatic_is_unchanged(self):
-        with mock.patch("serve.replicas.os.sched_getaffinity", return_value={0, 1, 2, 3}), \
-             mock.patch("serve.cpu_affinity.partition_cpu_sets", return_value=[[0, 1], [2, 3]]) as partition:
-            self.assertEqual(cpu_sets(2, True), [[0, 1], [2, 3]])
-            partition.assert_called_once_with(2, {0, 1, 2, 3})
-
-    def test_cpu_sets_explicit(self):
-        with mock.patch("serve.replicas.os.sched_getaffinity", return_value={0, 1, 2, 3}):
-            self.assertEqual(cpu_sets(2, [[0, 1], [2, 3]]), [[0, 1], [2, 3]])
-            with self.assertRaisesRegex(ReplicaConfigError, r"2 replicas.*1 list"):
-                cpu_sets(2, [[0, 1]])
-            with self.assertRaisesRegex(ReplicaConfigError, r"CPU 1 is in both replica 0 and replica 1"):
-                cpu_sets(2, [[0, 1], [1, 2]])
-            with self.assertRaisesRegex(ReplicaConfigError, r"allowed CPUs: \[0, 1, 2, 3\]"):
-                cpu_sets(2, [[0, 1], [2, 9]])
-            with self.assertRaisesRegex(ReplicaConfigError, "empty"):
-                cpu_sets(2, [[0, 1], []])
-            with self.assertRaisesRegex(ReplicaConfigError, "CPU number"):
-                cpu_sets(2, [[0, 1], [2, "3"]])
 
 
 class Routing(unittest.TestCase):
@@ -93,55 +72,6 @@ class Routing(unittest.TestCase):
         self.assertLessEqual(len(r.blocks), 10)
 
 
-class ConversationId(unittest.TestCase):
-    """The standard field only: no header, no user field (that one is the end user, not the conversation)."""
-
-    def test_the_standard_key_names_it(self):
-        self.assertEqual(conversation_id({"prompt_cache_key": "cache"}), "cache")
-        self.assertEqual(conversation_id({"prompt_cache_key": "  cache  "}), "cache")   # spaces are not the id
-        self.assertEqual(conversation_id({"prompt_cache_key": "x" * 500}), "x" * 128)   # bounded
-
-    def test_other_fields_are_not_a_conversation(self):
-        self.assertIsNone(conversation_id({"user": "session-1"}))
-        self.assertIsNone(conversation_id({}))
-        self.assertIsNone(conversation_id({"prompt_cache_key": "   "}))
-        self.assertIsNone(conversation_id({"prompt_cache_key": 7}))
-        self.assertIsNone(conversation_id(None))
-
-
-class ConversationKey(unittest.TestCase):
-    """No client change: the request's own first user message names the conversation."""
-
-    def test_the_first_user_message_names_it(self):
-        grown = [{"role": "user", "content": "build a thing"}, {"role": "assistant", "content": "ok"},
-                 {"role": "user", "content": "next"}]
-        self.assertEqual(conversation_key([{"role": "user", "content": "build a thing"}]), conversation_key(grown))
-        self.assertNotEqual(conversation_key([{"role": "user", "content": "build another thing"}]),
-                            conversation_key(grown))
-
-    def test_text_parts_are_read(self):
-        self.assertEqual(conversation_key([{"role": "user", "content": [{"type": "text", "text": "hi"}]}]),
-                         conversation_key([{"role": "user", "content": "hi"}]))
-
-    def test_a_system_prompt_is_not_the_conversation(self):
-        a = [{"role": "system", "content": "same system prompt"}, {"role": "user", "content": "one"}]
-        b = [{"role": "system", "content": "same system prompt"}, {"role": "user", "content": "two"}]
-        self.assertNotEqual(conversation_key(a), conversation_key(b))
-
-    def test_nothing_to_name(self):
-        self.assertIsNone(conversation_key([]))
-        self.assertIsNone(conversation_key([{"role": "assistant", "content": "hi"}]))
-        self.assertIsNone(conversation_key([{"role": "user", "content": "   "}]))
-        self.assertIsNone(conversation_key([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]))
-        self.assertIsNone(conversation_key(None))
-
-    def test_the_standard_key_wins(self):
-        msgs = [{"role": "user", "content": "same task"}]
-        self.assertEqual(request_conversation({"prompt_cache_key": "named"}, msgs), "named")
-        self.assertEqual(request_conversation({}, msgs), conversation_key(msgs))
-        self.assertIsNone(request_conversation({}, []))
-
-
 class FakeEngine:
     def __init__(self, n=4):
         self.batch, self.up = n, True
@@ -156,179 +86,40 @@ class FakeEngine:
         yield 7
 
 
-class Scheduling(unittest.TestCase):
-    """The queue (Scheduler) on a hand-driven clock: two one-request replicas, 1,000 prompt tokens a second."""
+class RouteChoice(unittest.TestCase):
+    def test_least_loaded_then_affinity(self):
+        e = ReplicaEngine([FakeEngine(), FakeEngine()], load_tokens=3000)
+        picks = [e.route([i] * 100) for i in range(4)]             # nothing cached: spread
+        self.assertEqual(sorted(picks), [0, 0, 1, 1])
+        ids = list(range(BLOCK * 8))
+        e.inflight = [0, 0]
+        k = e.route(ids)
+        e.router.note(k, ids)
+        e.inflight = [0, 0]
+        self.assertEqual(e.route(ids + [5] * 10), k)                # the conversation goes back
+        e.inflight = [0, 0]
+        e.inflight[k] = 1                                           # 512 tokens held < 3000 per running request
+        self.assertNotEqual(e.route(ids + [5] * 10), k)
 
-    def sched(self, n=2, service_s=None):
-        s = Scheduler(Router(n), [1] * n, prefill_tok_s=1000.0)
-        if service_s is not None:
-            s.service_s = service_s
-        return s
-
-    def submit(self, s, ids, now=0.0, **kw):
-        t = Ticket(ids, now, **kw)
-        s.submit(t)
-        return t
-
-    def test_nothing_cached_spreads_and_the_rest_queue(self):
-        s = self.sched()
-        ts = [self.submit(s, [i] * 100) for i in range(4)]
-        started = s.dispatch(0.0, [0, 1])
-        self.assertEqual(sorted(t.replica for t in started), [0, 1])
-        self.assertEqual(s.queue, ts[2:])
-        s.finish(started[0], 5.0)
-        self.assertEqual(s.dispatch(5.0, [0, 1]), [ts[2]])         # the oldest goes first
-        self.assertEqual(ts[2].replica, started[0].replica)
-
-    def test_a_turn_takes_its_free_warm_replica(self):
-        s = self.sched()
-        ids = list(range(BLOCK * 100))
-        s.router.note(1, ids)
-        t = self.submit(s, ids + [5] * 10)
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual(t.replica, 1)
-        self.assertIsNone(t.away)
-
-    def test_a_turn_waits_for_its_busy_replica_until_waiting_costs_more_than_reading(self):
-        s = self.sched()
-        ids = list(range(BLOCK * 100))                             # 6,400 tokens held on replica 1: 6.4 s to read
-        s.router.note(1, ids)
-        s.running[1] = 1
-        t = self.submit(s, ids + [5])
-        self.assertEqual(s.dispatch(0.0, [0, 1]), [])              # replica 0 is free, but moving costs more
-        self.assertAlmostEqual(s.next_wake(0.0, [0, 1]), 6.4)
-        self.assertEqual(s.dispatch(6.0, [0, 1]), [])
-        self.assertEqual(s.dispatch(6.4, [0, 1]), [t])             # rent no longer: it moves
-        self.assertEqual((t.replica, t.away), (0, (6400, 6.4)))
-
-    def test_a_queue_behind_the_warm_replica_moves_without_waiting(self):
-        s = self.sched(service_s=10.0)
-        ids = list(range(BLOCK * 100))
-        s.router.note(1, ids)
-        s.running[1] = 1
-        first = self.submit(s, ids + [1])
-        second = self.submit(s, ids + [2])                         # the second waits one service time (10 s) > 6.4 s
-        self.assertEqual(s.dispatch(0.0, [0, 1]), [first])         # so one moves: the oldest, first come first served
-        self.assertEqual(first.replica, 0)
-        self.assertIsNone(second.replica)                          # the second now is next on its own card
-
-    def test_the_cheapest_move_goes_first(self):
-        s = self.sched(service_s=100.0)
-        long, short = list(range(BLOCK * 100)), list(range(10**6, 10**6 + BLOCK * 10))
-        s.router.note(1, long)
-        s.router.note(1, short)
-        s.running[1] = 1
-        a = self.submit(s, long + [1])
-        b = self.submit(s, long + [2])
-        c = self.submit(s, short + [3])
-        self.assertEqual(s.dispatch(0.0, [0, 1]), [c])             # 640 tokens to read on replica 0, not 6,400
-        self.assertEqual((a.replica, b.replica), (None, None))
-
-    def test_a_new_talk_is_at_home_everywhere(self):
-        s = self.sched()
-        shared = list(range(BLOCK * 100))                          # both replicas hold the shared system prompt
-        s.router.note(0, shared)
-        s.router.note(1, shared)
-        s.running[1] = 1
-        t = self.submit(s, shared + [9] * 300)
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual((t.replica, t.away), (0, None))
-
-    def test_a_warm_new_talk_does_not_pile_on_the_warm_card(self):
-        """Only replica 0 holds the shared prefix: new talks start there, and replica 1 takes one as soon as waiting
-        costs more than reading the prefix — the warm card does not keep every session (2026-10-20, routed {0:11,1:2})."""
-        s = self.sched(service_s=10.0)
-        shared = list(range(BLOCK * 100))
-        s.router.note(0, shared)
-        ts = [self.submit(s, shared + [i] * 300) for i in range(3)]
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual([t.replica for t in ts], [0, 1, None])
-
-    def test_a_pinned_request_waits_for_its_card(self):
-        s = self.sched()
-        s.running[1] = 1
-        t = self.submit(s, [1] * 100, pin=1)
-        self.assertEqual(s.dispatch(100.0, [0, 1]), [])
-        self.assertIsNone(s.next_wake(100.0, [0, 1]))
-        s.running[1] = 0
-        self.assertEqual(s.dispatch(100.0, [0, 1]), [t])
-        self.assertEqual(t.replica, 1)
-
-    def test_a_dead_pin_is_placed_like_any_request(self):
-        s = self.sched()
-        t = self.submit(s, [1] * 100, pin=1)
-        s.dispatch(0.0, [0])
-        self.assertEqual(t.replica, 0)
-
-    def test_the_conversation_name_breaks_a_tie_only(self):
-        s = self.sched()
-        t = self.submit(s, [1] * 100, hint=1)
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual(t.replica, 1)
-        s = self.sched()
-        ids = list(range(BLOCK * 10))
-        s.router.note(0, ids)
-        s.running[0] = 1
-        t = self.submit(s, ids + [1], hint=0)                      # its name says 0, and 0 is warm, but busy
-        s.dispatch(0.0, [0, 1])
-        self.assertIsNone(t.replica)                               # it waits like any turn (640 tokens = 0.64 s)
-        s.dispatch(1.0, [0, 1])
-        self.assertEqual(t.replica, 1)
-
-    def test_a_held_replica_takes_nothing(self):
-        s = self.sched()
-        s.held[0] = 1
-        ts = [self.submit(s, [i] * 100) for i in range(2)]
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual([t.replica for t in ts], [1, None])
-
-    def test_the_service_time_is_measured(self):
-        s = self.sched()
-        self.assertAlmostEqual(s.service_s, LOAD_TOKENS / 1000.0)  # the prior
-        t = self.submit(s, [1] * 100)
-        s.dispatch(0.0, [0, 1])
-        s.finish(t, 13.0)
-        self.assertAlmostEqual(s.service_s, 3.0 + 0.2 * (13.0 - 3.0))
-        t = self.submit(s, [2] * 100, now=20.0)
-        s.dispatch(20.0, [0, 1])
-        s.finish(t, 20.5, measured=False)                           # cancelled before a token: not a service time
-        self.assertAlmostEqual(s.service_s, 5.0)
-
-    def test_six_sessions_warm_on_one_card_use_both(self):
-        """The 2026-10-21 incident: six requests warm on replica 1, replica 0 idle for minutes."""
-        s = self.sched(service_s=8.0)
-        shared = list(range(BLOCK * 100))
-        s.router.note(0, shared)
-        convs = [shared + list(range(10**6 * (i + 1), 10**6 * (i + 1) + BLOCK * 90)) for i in range(6)]
-        for c in convs:
-            s.router.note(1, c)
-        ts = [self.submit(s, c + [1]) for c in convs]
-        s.dispatch(0.0, [0, 1])
-        self.assertEqual(s.running, [1, 1])                         # both cards work at once
-        self.assertEqual([t.replica for t in ts[:2]], [1, 0])       # the oldest kept its cache, the next one moved
-
-
-class ReplicaQueue(unittest.TestCase):
-    """ReplicaEngine around the Scheduler: threads, cancel, dead replicas, the conversation name."""
-
-    def engine(self, slots=0):
-        e = ReplicaEngine([FakeEngine(slots), FakeEngine(slots)])
-        e.heal = lambda: None
-        return e
+    def test_a_long_prefix_outweighs_load(self):
+        e = ReplicaEngine([FakeEngine(), FakeEngine()], load_tokens=3000)
+        ids = list(range(BLOCK * 200))                              # 12,800 tokens held on replica 0
+        e.router.note(0, ids)
+        e.inflight = [2, 0]
+        self.assertEqual(e.route(ids + [1]), 0)
+        e.inflight = [5, 0]
+        self.assertEqual(e.route(ids + [1]), 1)
 
     def test_a_dead_replica_is_skipped(self):
-        e = self.engine()
-        e.engines[0].up = False
-        cancel = threading.Event()
-        selected = []
-        cancel._strata_replica_selected = selected.append
-        self.assertEqual(list(e.generate(list(range(BLOCK * 3)), 1, {}, cancel)), [7])
-        self.assertEqual(selected, [1])
-        e.engines[1].up = False
-        from serve.server import EngineDied
-        with self.assertRaises(EngineDied):
-            list(e.generate([1, 2], 1, {}, threading.Event()))
-        self.assertEqual(e.sched.queue, [])
+        a, b = FakeEngine(), FakeEngine()
+        e = ReplicaEngine([a, b])
+        e.heal = lambda: None
+        ids = list(range(BLOCK * 3))
+        e.router.note(0, ids)
+        a.up = False
+        self.assertEqual(e.route(ids), 1)
+        b.up = False
+        self.assertEqual(e.route(ids), -1)
 
     def test_nonfinite_forgets_the_replica(self):
         """#879: after DONE ... nonfinite the engine holds no conversation: the router forgets that replica."""
@@ -343,221 +134,28 @@ class ReplicaQueue(unittest.TestCase):
         other, ids = [9] * (BLOCK * 4), list(range(BLOCK * 3))
         e.router.note(0, other)
         e.router.note(1, other)
-        e.sched.held[1] = 1                                         # replica 0 takes it
-        with self.assertRaises(EngineNonFinite):
-            list(e.generate(ids, 10, {}, threading.Event()))
-        self.assertEqual(e.router.matched(ids)[0], 0)
-        self.assertEqual(e.router.matched(other)[0], 0)             # its older conversations too
-        self.assertEqual(e.router.matched(other)[1], len(other))
-        self.assertEqual(e.inflight, [0, 0])
+        k = 0
+        e.inflight[k] += 1                                          # as route() counts it
+        with mock.patch.object(e, "route", return_value=k):
+            with self.assertRaises(EngineNonFinite):
+                list(e.generate(ids, 10, {}, threading.Event()))
+        self.assertEqual(e.router.matched(ids)[k], 0)
+        self.assertEqual(e.router.matched(other)[k], 0)             # its older conversations too
+        self.assertEqual(e.router.matched(other)[1 - k], len(other))
+        self.assertEqual(e.inflight[k], 0)
 
     def test_batch_is_the_sum(self):
         self.assertEqual(ReplicaEngine([FakeEngine(4), FakeEngine(4)]).batch, 8)
         self.assertEqual(ReplicaEngine([FakeEngine(0), FakeEngine(0)]).batch, 2)
 
     def test_selected_replica_is_reported_for_solo_requests_too(self):
-        e = self.engine(slots=4)
-        e.sched.running[0] = 1
+        engine = ReplicaEngine([FakeEngine(), FakeEngine()])
+        engine.inflight[0] = 1
         cancel = threading.Event()
         selected = []
         cancel._strata_replica_selected = selected.append
-        self.assertEqual(list(e.generate([1, 2], 1, {}, cancel)), [7])
+        self.assertEqual(list(engine.generate([1, 2], 1, {}, cancel)), [7])
         self.assertEqual(selected, [1])
-
-    def test_a_queued_request_starts_when_a_replica_frees(self):
-        e = self.engine()
-        e.sched.held = [1, 1]                                       # both replicas busy with a session file
-        out, selected = [], []
-        cancel = threading.Event()
-        cancel._strata_replica_selected = selected.append
-        th = threading.Thread(target=lambda: out.extend(e.generate([1] * 100, 1, {}, cancel)))
-        th.start()
-        deadline = time.time() + 5
-        while e.waiting < 1 and time.time() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(e.waiting, 1)
-        with e.cv:
-            e.sched.held[1] = 0
-            e.cv.notify_all()
-        th.join(5)
-        self.assertEqual((out, selected, e.waiting), ([7], [1], 0))
-
-    def test_a_cancelled_request_leaves_the_queue(self):
-        e = self.engine()
-        e.sched.held = [1, 1]
-        cancel = threading.Event()
-        out = []
-        th = threading.Thread(target=lambda: out.extend(e.generate([1] * 100, 1, {}, cancel)))
-        th.start()
-        deadline = time.time() + 5
-        while e.waiting < 1 and time.time() < deadline:
-            time.sleep(0.01)
-        cancel.set()
-        th.join(5)
-        self.assertFalse(th.is_alive())
-        self.assertEqual((out, e.waiting, e.inflight), ([], 0, [0, 0]))
-
-    def test_one_request_at_a_time_on_an_engine_without_slots(self):
-        e = self.engine()
-        gate = threading.Event()
-
-        class Slow(FakeEngine):
-            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-                gate.wait(5)
-                yield 7
-
-        e.engines[:] = [Slow(0), Slow(0)]
-        ths = [threading.Thread(target=lambda i=i: list(e.generate([i] * 100, 1, {}, threading.Event())))
-               for i in range(3)]
-        for th in ths:
-            th.start()
-        deadline = time.time() + 5
-        while (e.inflight != [1, 1] or e.waiting != 1) and time.time() < deadline:
-            time.sleep(0.01)
-        self.assertEqual((e.inflight, e.waiting), ([1, 1], 1))
-        gate.set()
-        for th in ths:
-            th.join(5)
-        self.assertEqual((e.inflight, e.waiting, sum(e.routed)), ([0, 0], 0, 3))
-
-    def test_generate_binds_the_conversation(self):
-        e = self.engine(slots=4)
-        e.sched.running[0] = 2                                      # replica 1 has more room
-        cancel = threading.Event()
-        cancel._strata_conversation = "c4"
-        self.assertEqual(list(e.generate([1] * 100, 1, {}, cancel)), [7])
-        self.assertEqual(e.router.held("c4"), 1)
-        self.assertEqual(e.inflight, [2, 0])
-
-    def test_the_conversation_map_is_bounded(self):
-        r = Router(2, conv_cap=4)
-        for i in range(10):
-            r.bind(f"c{i}", i % 2)
-        self.assertEqual(len(r.convs), 4)
-        self.assertIsNone(r.held("c0"))
-        self.assertEqual(r.held("c9"), 1)
-
-    def test_a_replica_that_restarted_forgets_its_conversations(self):
-        r = Router(2)
-        r.bind("c3", 0)
-        r.forget(0)
-        self.assertIsNone(r.held("c3"))
-
-
-class SessionEngine(FakeEngine):
-    """A fake engine that answers SAVE / RESTORE like the real one, so the fan-out is testable."""
-
-    def __init__(self, n=0, refuse=None):
-        super().__init__()
-        self.batch = 0                      # one request at a time, like every replica of the deployment
-        self.k, self.calls, self.refuse = n, [], refuse
-
-    def session_file(self, action, path):
-        self.calls.append((action, path))
-        if self.refuse:
-            raise self.refuse
-        Path(path).write_bytes(b"%d" % self.k)
-        return {"tokens": 10 + self.k, "bytes": 2, "ms": 1.0 + self.k}
-
-
-class SessionFiles(unittest.TestCase):
-    """llama-server's single-slot SAVE / RESTORE, once per replica (serve/replicas.py)."""
-
-    def test_a_save_writes_one_file_per_replica_and_the_binding_map(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            engines = [SessionEngine(0), SessionEngine(1)]
-            engine = ReplicaEngine(engines)
-            engine.router.bind("conv-a", 1)
-            engine.router.bind("conv-b", 0)
-            out = engine.session_file("save", path)
-            self.assertEqual(out, {"tokens": 21, "bytes": 4, "ms": 2.0})
-            self.assertEqual(engines[0].calls, [("save", path)])
-            self.assertEqual(engines[1].calls, [("save", str(Path(tmp) / "auto.r1.bin"))])
-            self.assertTrue((Path(tmp) / "auto.bin").exists())
-            self.assertTrue((Path(tmp) / "auto.r1.bin").exists())
-            self.assertEqual(json.loads(Path(str(path) + SESSION_MAP).read_text())["bindings"],
-                             {"conv-a": 1, "conv-b": 0})
-
-    def test_a_restore_reads_the_bindings_and_skips_a_missing_replica_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            (Path(tmp) / "auto.bin").write_bytes(b"0")
-            (Path(tmp) / "auto.r1.bin").write_bytes(b"1")
-            (Path(str(path) + SESSION_MAP)).write_text(json.dumps({"bindings": {"conv-a": 1, "conv-b": 0}}))
-            engines = [SessionEngine(0), SessionEngine(1)]
-            engine = ReplicaEngine(engines)
-            out = engine.session_file("restore", path)
-            self.assertEqual(out["tokens"], 21)
-            self.assertEqual([c[0] for c in engines[0].calls], ["restore"])
-            self.assertEqual([c[0] for c in engines[1].calls], ["restore"])
-            self.assertEqual(engine.router.held("conv-a"), 1)
-            self.assertEqual(engine.router.held("conv-b"), 0)
-
-    def test_a_replica_without_a_saved_file_is_skipped(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            (Path(tmp) / "auto.bin").write_bytes(b"0")
-            engines = [SessionEngine(0), SessionEngine(1)]
-            engine = ReplicaEngine(engines)
-            engine.session_file("restore", path)
-            self.assertEqual([c[0] for c in engines[0].calls], ["restore"])
-            self.assertEqual(engines[1].calls, [])
-
-    def test_one_replica_refusing_does_not_stop_the_others(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            engines = [SessionEngine(0), SessionEngine(1, refuse=RuntimeError("no complete session to save"))]
-            out = ReplicaEngine(engines).session_file("save", path)
-            self.assertEqual(out["tokens"], 10)
-            self.assertTrue((Path(tmp) / "auto.bin").exists())
-            self.assertFalse((Path(tmp) / "auto.r1.bin").exists())
-
-    def test_all_replicas_refusing_raises(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            engines = [SessionEngine(0, refuse=RuntimeError("a")), SessionEngine(1, refuse=RuntimeError("b"))]
-            with self.assertRaises(RuntimeError):
-                ReplicaEngine(engines).session_file("save", path)
-
-    def test_the_map_keeps_the_newest_bindings(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            engine = ReplicaEngine([SessionEngine(0), SessionEngine(1)])
-            for i in range(SESSION_MAP_MAX + 5):
-                engine.router.bind("conv-%d" % i, i % 2)
-            engine.session_file("save", path)
-            saved = json.loads((Path(str(path) + SESSION_MAP)).read_text())["bindings"]
-            self.assertEqual(len(saved), SESSION_MAP_MAX)
-            self.assertNotIn("conv-0", saved)
-            self.assertIn("conv-%d" % (SESSION_MAP_MAX + 4), saved)
-
-    def test_parallel_slots_refuse_sessions(self):
-        engines = [SessionEngine(0), SessionEngine(1)]
-        for engine in engines:
-            engine.batch = 4
-        replica_engine = ReplicaEngine(engines)
-        self.assertFalse(replica_engine.session_serial)
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(ValueError):
-                replica_engine.session_file("save", str(Path(tmp) / "auto.bin"))
-
-    def test_a_save_waits_for_the_request_running_on_that_replica(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = str(Path(tmp) / "auto.bin")
-            engines = [SessionEngine(0), SessionEngine(1)]
-            engine = ReplicaEngine(engines)
-            done = threading.Event()
-            engine.sched.running[1] = 1                        # a request is running on replica 1
-            thread = threading.Thread(target=lambda: (engine.session_file("save", path), done.set()))
-            thread.start()
-            self.assertFalse(done.wait(0.5))                   # the save waits for it
-            with engine.cv:
-                engine.sched.running[1] = 0
-                engine.cv.notify_all()
-            self.assertTrue(done.wait(10))
-            thread.join()
-            self.assertTrue((Path(tmp) / "auto.r1.bin").exists())
 
 
 class ReplicaService(unittest.TestCase):
@@ -588,15 +186,15 @@ class ReplicaService(unittest.TestCase):
         if getattr(self, "tmp", None):
             self.tmp.cleanup()
 
-    def post(self, messages, max_tokens=64, **extra):
-        body = {"messages": messages, "max_tokens": max_tokens, "reasoning_effort": "none", **extra}
+    def post(self, messages, max_tokens=64):
+        body = {"messages": messages, "max_tokens": max_tokens, "reasoning_effort": "none"}
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())["choices"][0]["message"]["content"]
 
-    def chat(self, text, max_tokens=64, **extra):
-        return self.post([{"role": "user", "content": text}], max_tokens, **extra)
+    def chat(self, text, max_tokens=64):
+        return self.post([{"role": "user", "content": text}], max_tokens)
 
     def served(self):
         return [sum(1 for l in p.read_text().splitlines() if l.split()[0] in ("GEN", "BGEN")) if p.exists() else 0
@@ -700,16 +298,6 @@ class ReplicaService(unittest.TestCase):
         self.post([{"role": "user", "content": first}, {"role": "assistant", "content": reply},
                    {"role": "user", "content": "and then?"}], 16)
         self.assertEqual(self.served()[k], 2)
-
-    def test_a_named_conversation_keeps_its_replica_across_turns(self):
-        self.start()
-        first = "begin " + "lorem ipsum " * 40
-        reply = self.chat(first, user="named-conversation")
-        k = self.served().index(1)
-        for i in range(3):
-            self.post([{"role": "user", "content": first}, {"role": "assistant", "content": reply},
-                       {"role": "user", "content": f"and then? {i}"}], 16, user="named-conversation")
-            self.assertEqual(self.served()[k], 2 + i)
 
     def test_a_replica_that_died_is_skipped(self):
         self.start()

@@ -2759,12 +2759,9 @@ struct Engine {
         const auto t0 = Clock::now();
         warming = true;
         const int32_t filler = 198;   // a newline: any token works
-        // #4708: the prompt chunk may equal or exceed the context (--context 2048 with a 2048-token chunk): warm only cells that
-        // exist, and start the small-prompt, decode and speculative probes in a fresh sequence instead of appending past the cache.
-        std::vector<int32_t> toks((size_t) std::max(1, std::min(tmax, ctx)), filler);
+        std::vector<int32_t> toks((size_t) tmax, filler);
         process(toks.data(), (int64_t) toks.size(), [](int64_t) {});
-        reset();
-        if (tmax > kGemmT + 1 && ctx > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
+        if (tmax > kGemmT + 1) process(toks.data(), kGemmT + 1, [](int64_t) {});   // the smallest GEMM chunk too
         process(&filler, 1, [](int64_t) {});
         if (mtp_d > 0) {
             std::vector<int32_t> fix, drafts;
