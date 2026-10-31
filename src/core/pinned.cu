@@ -4,6 +4,10 @@
 #include "strata/core/pin_budget.hpp"
 #include <cstddef>
 
+#if !defined(_WIN32)
+#include <dirent.h>   // (count_kfd_nodes: opendir/readdir)
+#endif
+
 #include <cuda_runtime.h>
 
 #include <atomic>
